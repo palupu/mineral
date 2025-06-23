@@ -1,0 +1,9 @@
+torch
+hydra-core
+hydra_colorlog
+wandb
+termcolor
+tensorboard
+pandas
+tabulate
+scipy 
