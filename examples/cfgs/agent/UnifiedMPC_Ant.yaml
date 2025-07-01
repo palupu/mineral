@@ -1,0 +1,25 @@
+# @package _global_
+
+defaults:
+  - UnifiedMPC
+  - _self_
+
+name: UnifiedMPC_Ant
+
+agent:
+  unified_mpc:
+    horizon: 30  # Longer horizon for locomotion
+    max_iter: 150
+    
+    # Locomotion-specific cost weights
+    cost_weights:
+      position: 2.0      # Strong reward for forward motion
+      velocity: 0.05     # Light velocity regularization  
+      action: 0.001      # Light action regularization
+      
+# Task configuration
+task:
+  env:
+    env_suite: dflex
+    env_name: Ant
+    numEnvs: 1  # MPC uses single environment 

@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  # - base_config
+  - _self_
+
+algo: UnifiedMPC
+
+name: UnifiedMPC
+
+agent:
+  algo: UnifiedMPC
+
+  _target_: examples.agents.UnifiedMPC
+  
+  # MPC-specific parameters
+  unified_mpc:
+    num_actors: 1  # MPC uses single environment for planning
+    max_agent_steps: 1e6
+    horizon: 20  # MPC planning horizon
+    dt: 0.05  # Simulation timestep
+    max_iter: 100  # Maximum optimization iterations
+    
+    # Cost function weights (task-specific)
+    cost_weights:
+      # Locomotion tasks (dflex)
+      position: 1.0      # Reward forward motion
+      velocity: 0.1      # Smooth motion
+      action: 0.01       # Action regularization
+      
+      # Manipulation tasks (isaacgymenvs, dexdeform)
+      pose: 1.0          # Object pose tracking
+      
+      # Deformation tasks (plasticinelab)
+      shape: 1.0         # Shape deformation cost
+      
+      # Fluid tasks (softgym)
+      flow: 1.0          # Fluid flow cost
+      
+      # Soft body tasks (gradsim)
+      energy: 1.0        # Soft body energy
+      
+      # Generic tasks
+      observation: 1.0   # Generic observation cost
+
+  # Network config (not used by MPC but required by base class)
+  network:
+    _target_: mineral.networks.identity.Identity
+    
+  normalizers:
+    obs:
+      _target_: mineral.normalizers.identity.Identity
+    reward:
+      _target_: mineral.normalizers.identity.Identity 

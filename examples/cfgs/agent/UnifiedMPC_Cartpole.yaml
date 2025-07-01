@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - UnifiedMPC
+
+agent:
+  name: UnifiedMPC_Cartpole
+  
+  # MPC-specific parameters
+  horizon: 15  # Shorter horizon for fast cartpole dynamics
+  max_iter: 100  # Maximum optimization iterations
+  
+  # Cost weights for CartPole
+  cost_weights:
+    position: 5.0    # Strong penalty for pole angle deviation
+    velocity: 0.1    # Light velocity regularization
+    action: 0.001    # Light action regularization
+
+task:
+  # Task-specific configuration
+  env_suite: isaacgymenvs  # CartPole is in DFlex suite
+  env_name: Cartpole
+  numEnvs: 1  # Single environment for MPC 

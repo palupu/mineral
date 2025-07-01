@@ -1,0 +1,24 @@
+# @package _global_
+
+defaults:
+  - UnifiedMPC
+  - _self_
+
+name: UnifiedMPC_HandReorient
+
+agent:
+  unified_mpc:
+    horizon: 15  # Shorter horizon for manipulation
+    max_iter: 200  # More iterations for precise manipulation
+    
+    # Manipulation-specific cost weights
+    cost_weights:
+      pose: 5.0          # Strong object pose tracking
+      action: 0.01       # Moderate action regularization
+      
+# Task configuration  
+task:
+  env:
+    env_suite: isaacgymenvs
+    env_name: AllegroHand
+    numEnvs: 1  # MPC uses single environment 

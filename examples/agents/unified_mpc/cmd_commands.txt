@@ -1,0 +1,10 @@
+(app) root@3569060d5f72:/app/mineral# 
+python -m examples.run 'hydra.searchpath=[pkg://examples/cfgs]' task=Rewarped agent=UnifiedMPC_CartPole task.env.env_name=CartPole task.env.env_suite=isaacgymenvs \
+  logdir="workdir/RewarpedAnt4M-SAPO/$(date +%Y%m%d-%H%M%S.%2N)" \
+  agent.shac.max_epochs=2000 agent.shac.max_agent_steps=4.1e6 \
+  agent.network.actor_kwargs.mlp_kwargs.units=\[128,64,32\] \
+  agent.network.critic_kwargs.mlp_kwargs.units=\[64,64\] \
+  run=train_eval seed=1000
+
+PYTHONPATH=$PWD/third_party/isaacgym/python:$PWD/third_party/IsaacGymEnvs:$PYTHONPATH \
+python -m examples.run 'hydra.searchpath=[pkg://examples/cfgs]' task=Rewarped agent=UnifiedMPC_Cartpole task.env.env_name=Cartpole task.env.env_suite=isaacgymenvs seed=1000

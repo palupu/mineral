@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - UnifiedMPC
+
+agent:
+  name: UnifiedMPC_RollingPin
+  
+  # MPC-specific parameters  
+  horizon: 25  # Medium horizon for deformation planning
+  max_iter: 150  # More iterations for complex physics
+  dt: 0.02  # Smaller timestep for precision
+  
+  # Cost weights for RollingPin deformation task
+  cost_weights:
+    position: 3.0    # Reward for flattening/spreading dough
+    velocity: 0.05   # Light velocity regularization  
+    action: 0.001    # Light action regularization
+    
+    # Deformation-specific weights
+    deformation: 2.0   # Reward for achieving desired deformation
+    smoothness: 0.1    # Encourage smooth rolling motions
+
+task:
+  # Task-specific configuration
+  env_suite: plasticinelab  # RollingPin is in PlasticineLab suite
+  env_name: RollingPin
+  numEnvs: 1  # Single environment for MPC 

@@ -1,0 +1,34 @@
+agent:
+  _target_: mineral.examples.agents.dms1.dms1_with_warp.DMS1WithWarp
+  
+  network:
+    # Not used for DMS1 but required by base class
+    architecture: 'mlp'
+    hidden_dims: [64, 64]
+    
+  dms1:
+    # Horizon length - number of shooting intervals
+    N: 20
+    
+    # Time step size
+    DT: 0.05
+    
+    # Number of parallel environments
+    num_actors: 1
+    
+    # Maximum steps per episode
+    max_agent_steps: 200
+    
+    # Cost function weights
+    COST_THETA: 1.0          # Weight for angle error
+    COST_THETA_DOT: 0.1      # Weight for angular velocity
+    COST_CONTROL: 0.001      # Weight for control effort
+    COST_TERMINAL: 3.0       # Terminal cost weight
+    
+    # Physical parameters
+    GRAVITY: 10.0
+    LENGTH: 1.0  
+    MASS: 1.0
+    
+    # Optimization parameters
+    MAX_ITER: 100            # Maximum optimizer iterations per MPC step 
