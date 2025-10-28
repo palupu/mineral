@@ -1,0 +1,59 @@
+# Configuration for DMS MPC using Scipy Optimizers with Autodiff Gradients
+# This combines robust scipy NLP solvers with exact PyTorch autodiff gradients
+
+algo: DMSMPCScipyAutodiffAgent
+
+name: "dmsmpc_scipy_autodiff"
+class_name: "DMSMPCScipyAutodiffAgent"
+
+network:
+  name: "scipy_autodiff_dms_mpc"
+
+params:
+  num_actors: 1
+  max_agent_steps: 1000
+  render_results: false  # Set to true to replay saved trajectory
+
+dms_mpc_params:
+    # Horizon parameters
+    N: 10  # Number of shooting nodes (can be adjusted based on environment complexity)
+    timesteps: 50  # Total simulation timesteps (can be adjusted based on task requirements)
+    
+    # Optimization parameters
+    max_iter: 30  # Max iterations per MPC step
+    scipy_method: "SLSQP"  # Options: L-BFGS-B, SLSQP, TNC, trust-constr
+    
+    # Cost function weights
+    cost_state: 1.0
+    cost_control: 0.1
+    cost_terminal: 10.0
+    
+    # State and control dimensions (determined dynamically from environment)
+    # state_dim: auto-detected from env.observation_space
+    # control_dim: auto-detected from env.action_space
+
+# Optimizer Comparison:
+#
+# L-BFGS-B: (RECOMMENDED)
+#   - Quasi-Newton method with bounds
+#   - Fastest convergence for smooth problems
+#   - Typically 10-20 iterations
+#   - Good default choice
+#
+# SLSQP:
+#   - Sequential Least Squares Programming
+#   - Handles equality/inequality constraints
+#   - Slightly slower but more flexible
+#   - Use if you need constraints beyond bounds
+#
+# TNC:
+#   - Truncated Newton with bounds
+#   - Good middle ground
+#   - Robust to noisy gradients
+#
+# trust-constr:
+#   - Trust-region constrained
+#   - Most sophisticated algorithm
+#   - Slowest but most robust
+#   - Use for final refinement
+

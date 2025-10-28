@@ -1,0 +1,30 @@
+defaults:
+  - PointNet
+  - _self_
+
+algo: DMSMPC0Agent
+
+params:
+  num_actors: 1
+  max_agent_steps: 100000
+
+  # True: render results, False: evaluation
+  render_results: False
+  # render_results: True
+
+network: {}
+
+dms_mpc_params:
+  H: 20                       # Planning horizon
+  N: 10                       # Number of shooting nodes
+  timesteps: 50              # Number of timesteps
+  max_iter: 50                # Max optimization iterations
+  
+  # Cost parameters
+  cost_state: 1.0             # State cost weight
+  cost_control: 0.1           # Control cost weight
+  cost_terminal: 10.0         # Terminal cost weight
+  
+  # State and control dimensions for RollingFlat environment
+  state_dim: 6                # joint_q (3) + com_q (3) for RollingFlat
+  control_dim: 3              # dx, dy, ry actions for RollingFlat

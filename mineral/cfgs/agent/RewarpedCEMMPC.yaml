@@ -1,0 +1,26 @@
+defaults:
+  - PointNet
+  - _self_
+
+algo: CEMMPCAgent
+
+params:
+  num_actors: 64
+  max_agent_steps: 100000
+
+  # True: render results, False: evaluation
+  render_results: False
+  # render_results: True
+
+network: {}
+
+cem_mpc_params:
+  H: 30                       # Planning horizon
+  N: 1                       # Number of samples (action sequences)
+  K: 8                        # Number of elites
+  iterations: 3               # CEM optimization iterations
+  timesteps: 50              # Number of timesteps
+  beta: 1.0                   # colored-noise exponent (pink noise)
+  # gamma: 1.25                 # Sample decay factor
+  keep_elite_fraction: 0.3    # CEM with memory
+  alpha: 0.1                  # Momentum term

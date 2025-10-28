@@ -1,0 +1,40 @@
+# Configuration for Differentiable DMS MPC Agent
+# This uses automatic differentiation through Rewarped physics simulator
+
+agent:
+  name: "dmsmpc_differentiable"
+  class_name: "DMSMPCDifferentiableAgent"
+  
+  network:
+    name: "diff_dms_mpc"
+  
+  params:
+    num_actors: 1  # Number of parallel environments
+    max_agent_steps: 1000
+    render_results: false  # Set to true to replay saved trajectory
+  
+  dms_mpc_params:
+    # Horizon parameters
+    N: 10  # Number of shooting nodes (planning horizon)
+    timesteps: 50  # Total simulation timesteps
+    
+    # Optimization parameters
+    max_iter: 30  # Gradient descent iterations per MPC step
+    learning_rate: 0.05  # Learning rate for optimizer
+    optimizer: "Adam"  # Options: "Adam", "LBFGS"
+    
+    # Cost function weights
+    cost_state: 1.0  # Weight for state deviation cost
+    cost_control: 0.1  # Weight for control effort cost
+    cost_terminal: 10.0  # Weight for terminal state cost
+    
+    # State and control dimensions (determined dynamically from environment)
+    # state_dim: auto-detected from env.observation_space
+    # control_dim: auto-detected from env.action_space
+
+# Notes:
+# - Shorter horizons (N=5-10) work well with gradient-based optimization
+# - LBFGS often converges faster but uses more memory
+# - Adam is more stable for noisy gradients from complex physics
+# - Increase learning_rate (0.1-0.5) for faster convergence, decrease (0.01) for stability
+
