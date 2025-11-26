@@ -1,25 +1,23 @@
-"""TRUE Direct Multiple Shooting MPC with PyTorch Adam Optimizer.
+"""TRUE Direct Multiple Shooting MPC with Analytical Gradients.
 
-This implementation combines TRUE Direct Multiple Shooting (DMS) with penalty-based
-optimization using PyTorch's Adam optimizer and differentiable physics simulation.
+This implementation combines TRUE Direct Multiple Shooting (DMS) with analytical gradient
+computation through Rewarped's differentiable physics simulation.
 
 Key Features:
 1. TRUE DMS: Each shooting node x[i] is set independently before simulating to x[i+1]
-2. PyTorch Adam: First-order gradient-based optimization (replaces scipy SLSQP)
-3. Penalty Method: Hard constraints converted to soft penalties in loss function
-4. Analytical Gradients: All gradients via PyTorch autograd through Rewarped
-5. Full State Representation: All MPM particle positions + rigid body configuration
+2. Analytical Gradients: Cost gradients via PyTorch autograd
+3. Analytical Jacobians: Constraint Jacobians via differentiable physics simulation
+4. Full State Representation: All MPM particle positions + rigid body configuration
 
-Direct Multiple Shooting with Penalty Method:
-- Loss = task_cost + penalty_weight * ||x[i+1] - f(x[i], u[i])||^2
-- Each interval independently shoots from x[i] to verify x[i+1]
-- No hard constraints; penalties guide optimizer to feasible solutions
-- More flexible and scalable than constrained optimization
+Direct Multiple Shooting:
+- Constraints enforce: x[i+1] = f(x[i], u[i]) for EACH interval independently
+- No sequential dependency between nodes during constraint evaluation
+- More accurate for unstable/nonlinear dynamics compared to single shooting
 
 Gradient Computation:
-- Combined loss function: Automatic differentiation with PyTorch (.backward())
-- Adam optimizer uses first-order gradients only (no Hessian/Jacobian needed)
-- Differentiable physics simulation via Rewarped enables end-to-end gradients
+- Cost function: Automatic differentiation with PyTorch (.backward())
+- Constraint Jacobian: torch.autograd.functional.jacobian() through Rewarped
+- SLSQP optimizer receives exact analytical gradients (no finite differences)
 
 State Representation:
 - Uses ALL MPM particle positions (2592 particles for RollingPin)
@@ -37,7 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import warp as wp
-# from scipy.optimize import minimize
+from scipy.optimize import minimize
 
 from mineral.agents.agent import Agent
 
@@ -46,19 +44,17 @@ warnings.filterwarnings('ignore', message='.*grad attribute of a Tensor that is 
 
 
 class TrueDMSMPCAgent(Agent):
-    r"""TRUE Direct Multiple Shooting MPC with PyTorch Adam Optimizer.
+    r"""TRUE Direct Multiple Shooting MPC with Analytical Gradients.
 
-    This agent combines TRUE Direct Multiple Shooting (DMS) with penalty-based
-    optimization using PyTorch's Adam optimizer. Hard dynamics constraints are
-    converted to soft penalties, allowing efficient first-order optimization.
+    This agent combines TRUE Direct Multiple Shooting (DMS) with analytical gradient
+    computation via Rewarped's differentiable physics simulator. It provides exact
+    analytical gradients for both the cost function and constraint Jacobians.
 
-    Optimization Problem (Penalty Method):
-        minimize_{x, u}  L(x, u) = task_cost(x, u) + λ * constraint_penalty(x, u)
-
-        where:
-            task_cost = Σ cost(x[i], u[i]) + terminal_cost(x[N])
-            constraint_penalty = ||x[0] - x_current||^2 + Σ ||x[i+1] - f(x[i], u[i])||^2
-            λ = penalty_weight (large value enforces constraints)
+    Optimization Problem:
+        minimize_{x, u}  Σ cost(x[i], u[i]) + terminal_cost(x[N])
+        subject to:      x[0] = x_current
+                        x[i+1] = f(x[i], u[i])  for i = 0, ..., N-1
+                        u_min ≤ u[i] ≤ u_max
 
     State Representation:
         - State x: ALL MPM particle positions + rigid body configuration
@@ -67,11 +63,10 @@ class TrueDMSMPCAgent(Agent):
         - Example: 2592 particles → 7783-dimensional state vector
         - Control u: 3D input [dx, dy, ry] for RollingPin task
 
-    Optimization Approach:
-        - Optimizer: PyTorch Adam (first-order, adaptive learning rate)
-        - Gradients: ∇_xu L computed via PyTorch autograd (loss.backward())
-        - No Jacobian/Hessian needed: Adam only requires first-order gradients
-        - Leverages Rewarped's differentiable physics for exact gradients
+    Gradient Computation:
+        - Cost: ∇_xu J computed via PyTorch autograd (cost.backward())
+        - Constraints: Jacobian ∂c/∂xu via torch.autograd.functional.jacobian()
+        - Both leverage Rewarped's differentiable physics for exact gradients
     """
 
     def __init__(self, full_cfg: Any, **kwargs: Any) -> None:
@@ -93,30 +88,23 @@ class TrueDMSMPCAgent(Agent):
         self.cost_state = self.dms_mpc_params.cost_state
         self.cost_control = self.dms_mpc_params.cost_control
         self.cost_terminal = self.dms_mpc_params.cost_terminal
-        self.penalty_weight = self.dms_mpc_params.get('penalty_weight', 1000.0)  # Penalty for constraint violations
-        self.learning_rate = self.dms_mpc_params.get('learning_rate', 0.01)  # Adam learning rate
 
         # State and control dimensions - determined dynamically after env init
-        # self.control_dim = 3  # Fixed: dx, dy, ry for RollingPin
+        self.control_dim = 3  # Fixed: dx, dy, ry for RollingPin
         self.state_dim = None  # Will be set after first observation
         self.num_particles = None  # Number of MPM particles
-        self.mpm_pos_dim = None  # MPM particle positions (num_particles * 3)
-        self.mpm_vel_dim = None  # MPM particle velocities (num_particles * 3)
+        self.mpm_state_dim = None  # MPM particle state dimension (num_particles * 3)
         self.body_q_dim = None  # Body configuration dimension (7 for [x,y,z,qw,qx,qy,qz])
-        self.body_qd_dim = None  # Body velocity dimension (6 for [vx,vy,vz,wx,wy,wz])
         self.dim = None  # Will be state_dim + control_dim
 
         super().__init__(full_cfg, **kwargs)
 
-        # Get control dimension from parent Agent class
-        self.control_dim = self.action_dim
-
         self.obs = None
         self.dones = None
 
-        # Diagnostic attributes for loss breakdown
-        self._last_task_cost = 0.0
-        self._last_constraint_penalty = 0.0
+        # Performance tracking
+        self.constraint_eval_count = 0
+        self.cost_eval_count = 0
 
     def clone_state(self, state: Any) -> Any:
         """Clone state by copying all warp arrays and MPM structures.
@@ -159,20 +147,19 @@ class TrueDMSMPCAgent(Agent):
         return s
 
     def _obs_to_state(self, return_torch: bool = False):
-        """Extract full state vector from simulation (positions + velocities + body config).
+        """Extract full state vector from simulation (ALL MPM particle positions + body_q).
 
-        For TRUE DMS, we use COMPLETE state including velocities:
-        - All MPM particle positions and velocities
-        - Rigid body position, orientation, and velocities
+        For scientific research, we use the COMPLETE state: ALL particle positions
+        and rigid body configuration (roller position and orientation).
 
         RollingPin: 2592 particles in simulation, 250 in observations
         We use ALL 2592 for TRUE DMS to be mathematically correct.
 
-        State vector: [x1,y1,z1,...,xN,yN,zN, vx1,vy1,vz1,...,vxN,vyN,vzN, body_q (7), body_qd (6)]
+        State vector: [x1, y1, z1, ..., xN, yN, zN, body_x, body_y, body_z, qw, qx, qy, qz]
 
         Args:
             return_torch: If True, return torch.Tensor (for differentiable ops).
-                         If False, return numpy array (for compatibility).
+                         If False, return numpy array (for scipy optimization).
 
         Returns:
             state: State vector as numpy array or torch tensor
@@ -189,70 +176,55 @@ class TrueDMSMPCAgent(Agent):
         if not hasattr(full_state, 'mpm_x') or full_state.mpm_x is None:
             raise ValueError("State does not have mpm_x attribute for particle positions")
 
-        # Extract particle positions
+        # Extract all particle positions from simulation state
+        # Keep gradients if return_torch=True
         mpm_x = wp.to_torch(full_state.mpm_x)
+
+        # Move to correct device if needed
         if mpm_x.device != self.device:
             mpm_x = mpm_x.to(self.device)
 
-        # Handle batch/environment dimension
-        if mpm_x.ndim == 3:
-            mpm_x = mpm_x[0]  # Extract first env
-        elif mpm_x.ndim != 2:
+        # Handle batch/environment dimension if present
+        if mpm_x.ndim == 2:
+            # Shape: (num_particles, 3) - already correct
+            pass
+        elif mpm_x.ndim == 3:
+            # Shape: (num_envs, num_particles, 3) - extract first env
+            mpm_x = mpm_x[0]
+        else:
             raise ValueError(f"Expected mpm_x with 2 or 3 dims, got {mpm_x.ndim}")
 
+        # Flatten particle positions: (num_particles, 3) -> (num_particles * 3,)
         mpm_x_flat = mpm_x.flatten()
 
-        # Extract particle velocities
-        if not hasattr(full_state, 'mpm_v') or full_state.mpm_v is None:
-            raise ValueError("State does not have mpm_v attribute for particle velocities")
-
-        mpm_v = wp.to_torch(full_state.mpm_v)
-        if mpm_v.device != self.device:
-            mpm_v = mpm_v.to(self.device)
-
-        if mpm_v.ndim == 3:
-            mpm_v = mpm_v[0]
-        mpm_v_flat = mpm_v.flatten()
-
         # Extract body_q (rigid body position and orientation: [x, y, z, qw, qx, qy, qz])
-        state_components = [mpm_x_flat, mpm_v_flat]
-
         if hasattr(full_state, 'body_q') and full_state.body_q is not None:
             body_q = wp.to_torch(full_state.body_q)
             if body_q.device != self.device:
                 body_q = body_q.to(self.device)
+
+            # Handle batch dimension if present
             if body_q.ndim == 2:
                 body_q = body_q[0]  # Extract first body
-            state_components.append(body_q)
 
-        # Extract body_qd (rigid body velocity: [vx, vy, vz, wx, wy, wz])
-        if hasattr(full_state, 'body_qd') and full_state.body_qd is not None:
-            body_qd = wp.to_torch(full_state.body_qd)
-            if body_qd.device != self.device:
-                body_qd = body_qd.to(self.device)
-            if body_qd.ndim == 2:
-                body_qd = body_qd[0]  # Extract first body
-            state_components.append(body_qd)
-
-        # Concatenate all components
-        state = torch.cat(state_components)
+            # Concatenate mpm_x and body_q
+            state = torch.cat([mpm_x_flat, body_q])
+        else:
+            # Fallback: only use mpm_x if body_q is not available
+            state = mpm_x_flat
 
         # Initialize dimensions if this is the first call
         if self.state_dim is None:
             self.num_particles = mpm_x.shape[0]
-            self.mpm_pos_dim = self.num_particles * 3
-            self.mpm_vel_dim = self.num_particles * 3
+            self.mpm_state_dim = self.num_particles * 3
             self.body_q_dim = 7 if hasattr(full_state, 'body_q') and full_state.body_q is not None else 0
-            self.body_qd_dim = 6 if hasattr(full_state, 'body_qd') and full_state.body_qd is not None else 0
-            self.state_dim = self.mpm_pos_dim + self.mpm_vel_dim + self.body_q_dim + self.body_qd_dim
+            self.state_dim = self.mpm_state_dim + self.body_q_dim
             self.dim = self.state_dim + self.control_dim
             print(f"\n{'=' * 70}")
-            print("State Dimensions Initialized (FULL STATE + VELOCITIES):")
+            print("State Dimensions Initialized (FULL STATE - Research Mode):")
             print(f"  Number of particles: {self.num_particles}")
-            print(f"  MPM positions: {self.mpm_pos_dim} (particles × 3)")
-            print(f"  MPM velocities: {self.mpm_vel_dim} (particles × 3)")
-            print(f"  Body config (q): {self.body_q_dim} (x, y, z, qw, qx, qy, qz)")
-            print(f"  Body velocity (qd): {self.body_qd_dim} (vx, vy, vz, wx, wy, wz)")
+            print(f"  MPM particle dimension: {self.mpm_state_dim} (particles × 3)")
+            print(f"  Body configuration dimension: {self.body_q_dim} (x, y, z, qw, qx, qy, qz)")
             print(f"  Total state dimension: {self.state_dim}")
             print(f"  Control dimension: {self.control_dim}")
             print(f"  Total decision vars per node: {self.dim}")
@@ -264,37 +236,36 @@ class TrueDMSMPCAgent(Agent):
         else:
             return state.detach().cpu().numpy()
 
-    def _set_state_from_vector(self, state_vec, template_state: Any, zero_internal_states: bool = True) -> Any:
-        """Set full environment state from state vector (positions + velocities + body config).
+    def _set_state_from_vector(self, state_vec, template_state: Any) -> Any:
+        """Set full environment state from state vector (particle positions + body_q).
 
         This is THE KEY FUNCTION for true DMS. It allows the optimizer to
         propose arbitrary states x[i] at each shooting node, which we then
         set in the simulator before shooting to x[i+1].
 
+        For scientific research: We use the FULL state - all MPM particle positions
+        and rigid body configuration (roller position and orientation).
+
         Args:
             state_vec: Full state vector, shape (state_dim,)
                       Can be numpy array or torch.Tensor
-                      Contains: [mpm_x, mpm_v, body_q, body_qd]
+                      Contains: [x1, y1, z1, ..., xN, yN, zN, body_x, body_y, body_z, qw, qx, qy, qz]
             template_state: Full simulation state to use as template
-            zero_internal_states: If True, zero out MPM internal states (C, F, stress)
-                                 Should be True for shooting nodes, False for initial state
+                           (contains all MPM particles, grid, velocities, rigid bodies, etc.)
 
         Returns:
-            new_state: Full simulation state with updated positions/velocities
+            new_state: Full simulation state with updated particle positions and body configuration
         """
-        # Verify template state
+        # Verify template state has required attributes
         if not hasattr(template_state, 'mpm_x') or template_state.mpm_x is None:
             raise ValueError("Template state does not have mpm_x attribute")
 
         # Get expected dimensions
         num_particles = template_state.mpm_x.shape[0]
-        mpm_pos_dim = num_particles * 3
-        mpm_vel_dim = num_particles * 3
+        mpm_state_dim = num_particles * 3
         has_body_q = hasattr(template_state, 'body_q') and template_state.body_q is not None
-        has_body_qd = hasattr(template_state, 'body_qd') and template_state.body_qd is not None
         body_q_dim = 7 if has_body_q else 0
-        body_qd_dim = 6 if has_body_qd else 0
-        expected_size = mpm_pos_dim + mpm_vel_dim + body_q_dim + body_qd_dim
+        expected_size = mpm_state_dim + body_q_dim
 
         # Handle both numpy and torch inputs
         if isinstance(state_vec, np.ndarray):
@@ -307,63 +278,31 @@ class TrueDMSMPCAgent(Agent):
             raise ValueError(
                 f"State vector size mismatch! "
                 f"state_vec has {state_size} elements, "
-                f"but expected {expected_size} (mpm_x: {mpm_pos_dim}, mpm_v: {mpm_vel_dim}, "
-                f"body_q: {body_q_dim}, body_qd: {body_qd_dim})"
+                f"but expected {expected_size} ({mpm_state_dim} for mpm_x + {body_q_dim} for body_q)"
             )
 
-        # Clone full state
+        # Clone full state (including all MPM particles, velocities, stresses, rigid bodies, etc.)
         new_state = self.clone_state(template_state)
 
         # Convert to torch tensor if needed
         if isinstance(state_vec, np.ndarray):
             state_vec_torch = torch.from_numpy(state_vec.astype(np.float32)).to(self.device)
-        else:
+        else:  # Already torch.Tensor
             state_vec_torch = state_vec
             if state_vec_torch.dtype != torch.float32:
                 state_vec_torch = state_vec_torch.float()
             if state_vec_torch.device != self.device:
                 state_vec_torch = state_vec_torch.to(self.device)
 
-        # Parse state vector
-        idx = 0
-
         # Extract and set particle positions
-        mpm_x_flat = state_vec_torch[idx:idx + mpm_pos_dim]
+        mpm_x_flat = state_vec_torch[:mpm_state_dim]
         particle_positions = mpm_x_flat.reshape(num_particles, 3)
         new_state.mpm_x.assign(wp.from_torch(particle_positions))
-        idx += mpm_pos_dim
-
-        # Extract and set particle velocities
-        mpm_v_flat = state_vec_torch[idx:idx + mpm_vel_dim]
-        particle_velocities = mpm_v_flat.reshape(num_particles, 3)
-        new_state.mpm_v.assign(wp.from_torch(particle_velocities))
-        idx += mpm_vel_dim
 
         # Extract and set body_q if present
         if has_body_q:
-            body_q_vec = state_vec_torch[idx:idx + body_q_dim]
+            body_q_vec = state_vec_torch[mpm_state_dim:]
             new_state.body_q.assign(wp.from_torch(body_q_vec.unsqueeze(0)))  # Add batch dimension
-            idx += body_q_dim
-
-        # Extract and set body_qd if present
-        if has_body_qd:
-            body_qd_vec = state_vec_torch[idx:idx + body_qd_dim]
-            new_state.body_qd.assign(wp.from_torch(body_qd_vec.unsqueeze(0)))  # Add batch dimension
-            idx += body_qd_dim
-
-        # Zero out internal MPM states for physical consistency
-        # These should be recomputed by the simulator from positions/velocities
-        if zero_internal_states:
-            if hasattr(new_state, 'mpm_C') and new_state.mpm_C is not None:
-                new_state.mpm_C.zero_()
-            if hasattr(new_state, 'mpm_F') and new_state.mpm_F is not None:
-                # F should be identity, not zero
-                new_state.mpm_particle.init_F()
-            if hasattr(new_state, 'mpm_stress') and new_state.mpm_stress is not None:
-                new_state.mpm_stress.zero_()
-            # Zero grid state (will be recomputed)
-            if hasattr(new_state, 'mpm_grid') and new_state.mpm_grid is not None:
-                new_state.mpm_grid.clear()
 
         return new_state
 
@@ -402,40 +341,41 @@ class TrueDMSMPCAgent(Agent):
 
         return next_state
 
-    def compute_loss(self, x_u: torch.Tensor, current_x: torch.Tensor, template_state: Any) -> torch.Tensor:
-        """Combined loss function: task cost + penalty for constraint violations.
+    def cost(self, x_u: np.ndarray) -> tuple[float, np.ndarray]:
+        """Cost function for the optimization problem.
 
-        This replaces hard constraints with soft penalties (penalty method).
-        Loss = task_cost + penalty_weight * constraint_violations
+        Matches RollingPin reward structure (cost = -reward):
+        - Minimize average particle height (flatten the dough)
+        - Minimize height variance (uniform flatness)
+        - Minimize control effort
 
-        Args:
-            x_u: Decision variables [x0, u0, x1, u1, ..., x_{N-1}, u_{N-1}, xN]
-            current_x: Current observed state (for initial constraint)
-            template_state: Template simulation state
-
-        Returns:
-            total_loss: Scalar tensor to minimize
+        State x contains particle positions + body_q: [x1,y1,z1, ..., xN,yN,zN, body_x, body_y, body_z, qw, qx, qy, qz]
+        We extract y-coordinates (height) of particles and compute mean + variance.
         """
+        self.cost_eval_count += 1
+        # Convert numpy array to torch tensor with gradient tracking
+        device = self.device
+        x_u_torch = torch.tensor(x_u, dtype=torch.float64, requires_grad=True, device=device)
+
         # Reshape into state and control sequences
-        last_x = x_u[-self.state_dim :]
-        x_u_short = x_u[: -self.state_dim].reshape(self.N, self.dim)
+        last_x = x_u_torch[-self.state_dim :]
+        x_u_torch_short = x_u_torch[: -self.state_dim].reshape(self.N, self.dim)
 
-        x = torch.cat([x_u_short[:, : self.state_dim], last_x.unsqueeze(0)], dim=0)
-        u = x_u_short[:, self.state_dim :]
+        x = torch.cat([x_u_torch_short[:, : self.state_dim], last_x.unsqueeze(0)], dim=0)
+        u = x_u_torch_short[:, self.state_dim :]
 
-        # ========== TASK COST ==========
         # Reference height from RollingPin (self.h = 0.125)
         h_ref = 0.125
 
-        task_cost = 0.0
+        # Compute stage costs matching RollingPin reward
+        cost_value = 0.0
 
         # Vecotirzien
         # dummy set
-        # Stage costs
         for i in range(self.N):
-            # Extract only particle positions from state (first mpm_pos_dim elements)
-            # State format: [mpm_x (num_particles*3), mpm_v (num_particles*3), body_q (7), body_qd (6)]
-            mpm_x_flat = x[i][:self.mpm_pos_dim]
+            # Extract only particle positions from state (first mpm_state_dim elements)
+            # State format: [mpm_x (num_particles*3), body_q (7)]
+            mpm_x_flat = x[i][:self.mpm_state_dim]
             particles = mpm_x_flat.reshape(self.num_particles, 3)
 
             # Extract heights (y-coordinates, index 1)
@@ -457,52 +397,161 @@ class TrueDMSMPCAgent(Agent):
 
             # Total stage cost
             stage_cost = self.cost_state * (height_cost + variance_cost) + control_cost
-            task_cost += stage_cost
+            cost_value += stage_cost
 
         # Terminal cost: emphasize final state (flat + uniform)
-        mpm_x_flat_final = x[self.N][:self.mpm_pos_dim]
+        mpm_x_flat_final = x[self.N][:self.mpm_state_dim]
         particles_final = mpm_x_flat_final.reshape(self.num_particles, 3)
         heights_final = particles_final[:, 1]
         mean_height_final = heights_final.mean()
         variance_final = heights_final.var()
 
         terminal_cost = self.cost_terminal * ((mean_height_final / h_ref) ** 2 + variance_final)
-        task_cost += terminal_cost
+        cost_value += terminal_cost
 
-        # ========== CONSTRAINT PENALTIES ==========
-        constraint_penalty = 0.0
+        # Compute gradients using automatic differentiation
+        cost_value.backward()
 
-        # Initial constraint: first state must match current state
-        initial_violation = torch.sum((x[0] - current_x) ** 2)
-        constraint_penalty += initial_violation
+        print(f"Cost evaluation #{self.cost_eval_count}: {cost_value.item():.6f}", flush=True)
 
-        # Dynamics constraints: x[i+1] should match f(x[i], u[i])
-        for i in range(self.N):
-            # Set environment to state x[i] and simulate
-            state_at_node_i = self._set_state_from_vector(x[i], template_state)
-            next_state_sim = self.simulate_single_step(state_at_node_i, u[i], return_torch=True)
+        return cost_value.item(), x_u_torch.grad.cpu().numpy()
 
-            # Penalty for violation: ||x[i+1] - f(x[i], u[i])||^2
-            dynamics_violation = torch.sum((x[i + 1] - next_state_sim) ** 2)
-            constraint_penalty += dynamics_violation
+    def eq_constraint_differentiable(
+        self, x_u: torch.Tensor, current_x: torch.Tensor, template_state: Any
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """TRUE Direct Multiple Shooting Equality Constraints with Jacobian computation.
 
-        # Total loss
-        total_loss = task_cost + self.penalty_weight * constraint_penalty
-
-        # Store components for diagnostics (as attributes so we can access them)
-        self._last_task_cost = task_cost.item()
-        self._last_constraint_penalty = constraint_penalty.item()
-
-        return total_loss
-
-
-    def dms_plan(self, current_x: np.ndarray, init_state: Any) -> torch.Tensor:
-        """Direct Multiple Shooting MPC planning with PyTorch Adam optimizer.
-
-        Uses penalty method: constraints are enforced as soft penalties in the loss.
+        This version uses Rewarped's differentiable simulation to compute analytical
+        gradients (Jacobian) of the constraints with respect to decision variables.
 
         Args:
-            current_x: Current observed state vector (numpy)
+            x_u: Decision variables as torch.Tensor with requires_grad=True
+            current_x: Current observed state as torch.Tensor
+            template_state: Template simulation state (with all MPM data)
+
+        Returns:
+            constraints: Constraint violations as torch.Tensor
+            jacobian: Jacobian matrix d(constraints)/d(x_u)
+        """
+        # Extract states and controls from the trajectory
+        x = x_u[: -self.state_dim].reshape(self.N, self.dim)[:, : self.state_dim]
+        x = torch.cat([x, x_u[-self.state_dim :].unsqueeze(0)], dim=0)
+        u = x_u[: -self.state_dim].reshape(self.N, self.dim)[:, self.state_dim :]
+
+        # Pre-allocate constraints tensor
+        constraints = torch.zeros((self.N + 1) * self.state_dim, dtype=torch.float32, device=self.device)
+
+        # Initial constraint: first state must match current state
+        constraints[: self.state_dim] = x[0] - current_x
+
+        # TRUE MULTIPLE SHOOTING: Each interval is independent!
+        for i in range(self.N):
+            # 1. Set environment to the optimizer's proposed state x[i]
+            state_at_node_i = self._set_state_from_vector(x[i], template_state)
+
+            # 2. Simulate one step with control u[i] - DIFFERENTIABLE!
+            next_state_sim = self.simulate_single_step(state_at_node_i, u[i], return_torch=True)
+
+            # 3. Constraint: simulated state must match optimizer's x[i+1]
+            start_idx = (i + 1) * self.state_dim
+            end_idx = (i + 2) * self.state_dim
+            constraints[start_idx:end_idx] = x[i + 1] - next_state_sim
+
+        # Compute Jacobian using autograd - this is where Rewarped shines!
+        # We need the full Jacobian matrix: (num_constraints, num_variables)
+        # Note: For high-dimensional problems (23k+ constraints), this is computationally expensive
+        # but provides exact analytical gradients
+
+        # Use torch.autograd.functional.jacobian for efficient computation
+        # This computes the full Jacobian matrix in one call
+        def constraint_fn(xu):
+            # Extract states and controls from the trajectory
+            x_local = xu[: -self.state_dim].reshape(self.N, self.dim)[:, : self.state_dim]
+            x_local = torch.cat([x_local, xu[-self.state_dim :].unsqueeze(0)], dim=0)
+            u_local = xu[: -self.state_dim].reshape(self.N, self.dim)[:, self.state_dim :]
+
+            # Pre-allocate constraints tensor
+            constraints_local = torch.zeros((self.N + 1) * self.state_dim, dtype=torch.float32, device=self.device)
+
+            # Initial constraint
+            constraints_local[: self.state_dim] = x_local[0] - current_x
+
+            # TRUE MULTIPLE SHOOTING: Each interval is independent!
+            for i in range(self.N):
+                state_at_node_i = self._set_state_from_vector(x_local[i], template_state)
+                next_state_sim = self.simulate_single_step(state_at_node_i, u_local[i], return_torch=True)
+                start_idx = (i + 1) * self.state_dim
+                end_idx = (i + 2) * self.state_dim
+                constraints_local[start_idx:end_idx] = x_local[i + 1] - next_state_sim
+
+            return constraints_local
+
+        # Compute full Jacobian matrix efficiently
+        print(f"Computing Jacobian ({(self.N + 1) * self.state_dim}x{len(x_u)})...", end='', flush=True)
+        jacobian = torch.autograd.functional.jacobian(constraint_fn, x_u, create_graph=False, strict=True)
+        print(" done!", flush=True)
+
+        return constraints, jacobian
+
+    def eq_constraint(self, x_u: np.ndarray, current_x: np.ndarray, template_state: Any) -> Tuple[np.ndarray, np.ndarray]:
+        """TRUE Direct Multiple Shooting Equality Constraints with analytical Jacobian.
+
+        This wrapper uses Rewarped's differentiable simulation to compute both
+        constraints and their analytical Jacobian for SLSQP optimization.
+
+        This is the KEY difference from pseudo-DMS. Each shooting interval is
+        evaluated INDEPENDENTLY:
+
+        For each i = 0, ..., N-1:
+            1. Set environment to state x[i] (using _set_state_from_vector)
+            2. Simulate one step with control u[i] (differentiable!)
+            3. Constraint: simulated_state must equal x[i+1]
+
+        Critically: We do NOT carry forward the simulated state to the next iteration.
+        Each interval shoots from the optimizer's proposed x[i], not from the
+        simulation result.
+
+        Args:
+            x_u: Decision variables [x0, u0, x1, u1, ..., x_{N-1}, u_{N-1}, xN]
+            current_x: Current observed state (for initial constraint)
+            template_state: Template simulation state (with all MPM data)
+
+        Returns:
+            constraints: Array of constraint violations, shape ((N+1) * state_dim,)
+            jacobian: Jacobian matrix d(constraints)/d(x_u), shape ((N+1)*state_dim, len(x_u))
+        """
+        self.constraint_eval_count += 1
+        print(f"Constraint #{self.constraint_eval_count} starting...")
+
+        # Convert to torch tensors for differentiable computation
+        x_u_torch = torch.tensor(x_u, dtype=torch.float32, requires_grad=True, device=self.device)
+        current_x_torch = torch.tensor(current_x, dtype=torch.float32, device=self.device)
+
+        # Compute constraints and analytical Jacobian using differentiable simulation
+        constraints, jacobian = self.eq_constraint_differentiable(x_u_torch, current_x_torch, template_state)
+
+        # Convert back to numpy for scipy optimizer
+        constraints_np = constraints.detach().cpu().numpy().astype(np.float64)
+        jacobian_np = jacobian.detach().cpu().numpy().astype(np.float64)
+
+        # Report constraint violation metrics
+        max_violation = np.max(np.abs(constraints_np))
+        rms_violation = np.sqrt(np.mean(constraints_np**2))
+
+        print(
+            f"Constraint #{self.constraint_eval_count} done: "
+            f"max={max_violation:.4e} rms={rms_violation:.4e} "
+            f"Jacobian shape={jacobian_np.shape}",
+            flush=True,
+        )
+
+        return constraints_np, jacobian_np
+
+    def dms_plan(self, current_x: np.ndarray, init_state: Any) -> torch.Tensor:
+        """Direct Multiple Shooting MPC planning with TRUE independent shooting.
+
+        Args:
+            current_x: Current observed state vector
             init_state: Current full environment state (template for state setting)
 
         Returns:
@@ -518,130 +567,106 @@ class TrueDMSMPCAgent(Agent):
                 f"State dimension mismatch! current_x has {len(current_x)} elements but self.state_dim={self.state_dim}"
             )
 
-        # Convert current state to torch tensor
-        current_x_torch = torch.tensor(current_x, dtype=torch.float32, device=self.device)
+        # Initialize state and control vector
+        x_u = np.zeros((self.state_dim + self.control_dim) * self.N + self.state_dim)  # dtype=np.float64
 
-        # Initialize decision variables as torch tensor with gradient
-        x_u_init = torch.zeros(
-            (self.state_dim + self.control_dim) * self.N + self.state_dim,
-            dtype=torch.float32,
-            device=self.device,
-            requires_grad=True
-        )
+        # Initialize state trajectory with current state (warm start)
+        for i in range(self.N):
+            x_u[i * self.dim : i * self.dim + self.state_dim] = current_x
+        x_u[self.N * self.dim : self.N * self.dim + self.state_dim] = current_x
 
-        # Warm start: initialize state trajectory with current state
-        # IMPORTANT: Initialize controls with small random values (not zero!)
-        with torch.no_grad():
-            for i in range(self.N):
-                # Initialize states
-                x_u_init[i * self.dim : i * self.dim + self.state_dim] = current_x_torch
-                # Initialize controls with small random values
-                control_start = i * self.dim + self.state_dim
-                control_end = control_start + self.control_dim
-                x_u_init[control_start:control_end] = torch.randn(self.control_dim, device=self.device) * 0.1
-            # Final state
-            x_u_init[self.N * self.dim : self.N * self.dim + self.state_dim] = current_x_torch
+        # Define bounds
+        control_bounds = [(-1.0, 1.0)] * self.control_dim  # Control bounds
+        state_bounds = [(None, None)] * self.state_dim  # No bounds on states
+
+        # Repeat bounds for each shooting node
+        bounds = (state_bounds + control_bounds) * self.N + state_bounds
 
         # Save the original state
         original_state = self.clone_state(init_state)
 
-        # Create optimizer
-        x_u = torch.nn.Parameter(x_u_init.clone())
-        optimizer = torch.optim.Adam([x_u], lr=self.learning_rate)
+        # Reset constraint evaluation counter
+        self.constraint_eval_count = 0
+        self.cost_eval_count = 0
+        self.iteration_count = 0
+
+        # Create constraint wrapper that returns both constraints and Jacobian
+        def eq_constraint_wrapper(x_u: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            return self.eq_constraint(x_u, current_x, init_state)
+
+        # Define constraints with analytical Jacobian from Rewarped
+        eq_cons = {
+            'type': 'eq',
+            'fun': lambda x: eq_constraint_wrapper(x)[0],  # Constraint values
+            'jac': lambda x: eq_constraint_wrapper(x)[1],  # Analytical Jacobian
+        }
 
         print(f"\n{'=' * 70}")
-        print("Starting TRUE DMS Optimization (PyTorch Adam + Penalty Method)")
+        print("Starting TRUE DMS Optimization (with Rewarped Analytical Jacobians)")
         print(f"  Particles: {self.num_particles}")
         print(f"  Nodes: {self.N}, State dim: {self.state_dim}, Control dim: {self.control_dim}")
         print(f"  Decision variables: {len(x_u)}")
-        print(f"  Penalty weight: {self.penalty_weight}")
-        print(f"  Learning rate: {self.learning_rate}")
-        print(f"  Max iterations: {self.max_iter}")
-        print("  Using differentiable simulation with Adam optimizer ✓")
-
-        # Print initial controls
-        with torch.no_grad():
-            initial_controls = []
-            for i in range(self.N):
-                control_start = i * self.dim + self.state_dim
-                control_end = control_start + self.control_dim
-                initial_controls.append(x_u[control_start:control_end].cpu().numpy())
-            print(f"  Initial controls: {[f'[{c[0]:.3f} {c[1]:.3f} {c[2]:.3f}]' for c in initial_controls]}")
+        print(f"  Constraints: {(self.N + 1) * self.state_dim} equality constraints")
+        print("  Using differentiable simulation for analytical gradients ✓")
         print(f"{'=' * 70}\n")
 
-        # Optimization loop
+        # Run SLSQP optimization with analytical gradients
         start_time = time.time()
-        best_loss = float('inf')
-        best_x_u = None
-
-        for iteration in range(self.max_iter):
-            optimizer.zero_grad()
-
-            # Compute loss (task cost + constraint penalties)
-            loss = self.compute_loss(x_u, current_x_torch, init_state)
-
-            # Backward pass
-            loss.backward()
-
-            # Check gradient norms for debugging
-            if iteration % 10 == 0:
-                grad_norm = x_u.grad.norm().item() if x_u.grad is not None else 0.0
-                # Check control gradients specifically
-                control_grads = []
-                for i in range(self.N):
-                    control_start = i * self.dim + self.state_dim
-                    control_end = control_start + self.control_dim
-                    if x_u.grad is not None:
-                        control_grads.append(x_u.grad[control_start:control_end].norm().item())
-                avg_control_grad = sum(control_grads) / len(control_grads) if control_grads else 0.0
-
-            # Optimizer step (BEFORE clipping!)
-            optimizer.step()
-
-            # Apply control bounds by clipping AFTER optimizer step
-            with torch.no_grad():
-                for i in range(self.N):
-                    control_start = i * self.dim + self.state_dim
-                    control_end = control_start + self.control_dim
-                    # Clip control values to [-1, 1]
-                    x_u.data[control_start:control_end].clamp_(-1.0, 1.0)
-
-            # Track best solution
-            loss_val = loss.item()
-            if loss_val < best_loss:
-                best_loss = loss_val
-                best_x_u = x_u.data.clone()
-
-            # Print progress with gradient info and loss breakdown
-            if iteration % 10 == 0 or iteration == self.max_iter - 1:
-                print(f"Iteration {iteration:4d}/{self.max_iter} | Loss: {loss_val:.6e} | "
-                      f"TaskCost: {self._last_task_cost:.4e} | ConstraintPenalty: {self._last_constraint_penalty:.4e} | "
-                      f"Grad: {grad_norm:.4e} | ControlGrad: {avg_control_grad:.4e}", flush=True)
-
+        result = minimize(
+            fun=self.cost,
+            x0=x_u,
+            method='SLSQP',
+            jac=True,
+            bounds=bounds,
+            constraints=[eq_cons],  # Constraints provide analytical Jacobian
+            options={
+                'disp': True,
+                'maxiter': self.max_iter,
+                # 'ftol': 1e-9,  # Tighter function tolerance (cost change)
+                # 'eps': 1e-8,   # Finite difference step for gradient
+            },
+        )
         elapsed_time = time.time() - start_time
 
-        # Use best solution
-        if best_x_u is not None:
-            x_u.data = best_x_u
+        # Evaluate final constraint satisfaction
+        final_constraints, _ = eq_constraint_wrapper(result.x)
+        max_constraint_viol = np.max(np.abs(final_constraints))
+        mean_constraint_viol = np.mean(np.abs(final_constraints))
 
         # Restore the original state after optimization
         self.env.state_0 = original_state
 
         # Extract the first control input (MPC receding horizon principle)
-        with torch.no_grad():
-            action = x_u[self.state_dim : self.state_dim + self.control_dim].clone()
+        action = result.x[self.state_dim : self.state_dim + self.control_dim]
 
         # Report optimization results
         print(f"\n{'=' * 70}")
         print("Optimization Results")
         print(f"{'=' * 70}")
-        print(f"  Final Loss: {best_loss:.6e}")
-        print(f"  Iterations: {self.max_iter}")
+        print(f"  Status: {result.message}")
+        print(f"  Success: {result.success}")
+        print(f"  Final Cost: {result.fun:.6f}")
+        print(f"  Iterations: {result.nit}")
+        print(f"  Function Evaluations: {result.nfev}")
+        print(f"  Constraint Evaluations: {self.constraint_eval_count}")
         print(f"  Optimization Time: {elapsed_time:.2f}s")
-        print(f"  Optimal Action: {action.cpu().numpy()}")
+        print("\n  Constraint Satisfaction:")
+        print(f"    • Maximum Violation: {max_constraint_viol:.4e}")
+        print(f"    • Mean Violation: {mean_constraint_viol:.4e}")
+
+        # Check constraint tolerance
+        constraint_tolerance = 0.01
+        constraints_satisfied = max_constraint_viol < constraint_tolerance
+
+        if constraints_satisfied:
+            print(f"    • Status: ✓ Satisfied (tolerance: {constraint_tolerance})")
+        else:
+            print(f"    • Status: ⚠ Exceeds tolerance ({constraint_tolerance})")
+
+        print(f"\n  Optimal Action: {action}")
         print(f"{'=' * 70}\n")
 
-        return action
+        return torch.tensor(action, device=self.device, dtype=torch.float32)
 
     def eval(self) -> None:
         if self.render_results:
@@ -667,12 +692,11 @@ class TrueDMSMPCAgent(Agent):
         current_x = self._obs_to_state()
 
         print(f"\n{'#' * 70}")
-        print(f"{'TRUE DIRECT MULTIPLE SHOOTING MPC (PyTorch Adam)':^70}")
+        print(f"{'TRUE DIRECT MULTIPLE SHOOTING MPC':^70}")
         print(f"{'#' * 70}")
         print(f"Full State Representation: All {self.num_particles} MPM particles")
         print(f"Horizon: N={self.N} nodes, H={self.H:.2f}s")
         print(f"State dim: {self.state_dim}, Control dim: {self.control_dim}")
-        print(f"Optimizer: Adam (lr={self.learning_rate}, penalty_weight={self.penalty_weight})")
         print(f"Timesteps: {self.timesteps}")
         print(f"{'#' * 70}\n")
 
@@ -688,21 +712,14 @@ class TrueDMSMPCAgent(Agent):
             # Save the current full state
             init_state = self.clone_state(self.env.state_0)
 
-            # Disable USD recording during optimization (we only want actual executed steps recorded)
-            saved_renderer = self.env.renderer
-            self.env.renderer = None
-
             # Plan using TRUE DMS MPC
             best_action = self.dms_plan(current_x, init_state)
             actions = best_action.unsqueeze(0).repeat(self.num_actors, 1)
 
-            # Re-enable USD recording for actual execution
-            self.env.renderer = saved_renderer
-
             # Restore state before executing the action
             self.env.state_0 = init_state
 
-            # Step the environment forward with the best action (this WILL be recorded)
+            # Step the environment forward with the best action
             obs, reward, done, _ = self.env.step(actions)
             self.obs = self._convert_obs(obs)
             self.dones = done
