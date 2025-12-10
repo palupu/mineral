@@ -1,0 +1,32 @@
+
+
+run
+    for timesteps
+        u = singelshooting(xk, u_next)
+        env.step(u[0]) (real)
+        u_next = [u1, ..., u_n-1, u_n-1]
+
+singleshooting(xk, u_next): uk
+    u = [u0, ... , u_n-1]
+    
+    adam(u)
+    
+    for iterations
+        zero_grad
+        loss = loss(xk, u)
+        backward()
+        adam.optim()
+        print(loss) 
+
+    #self.u=u when using singleshooting class
+    return u
+
+loss(xk, u):
+    env.state_0 = xk (model) (complete state)
+    cummulative_reward = 0
+    for u_n in u:
+
+        reward = env.step(u_n)
+        cummulative_reward += reward;
+
+    return -cummulative_reward (test with minus and without)

@@ -1,0 +1,189 @@
+# Configuration for TRUE Direct Multiple Shooting MPC
+# This implements proper DMS with independent shooting nodes using PyTorch Adam
+# 
+# OPTIMIZATION APPROACH:
+#   - Optimizer: PyTorch Adam (first-order gradient descent)
+#   - Penalty Method: Hard constraints converted to soft penalties
+#   - No scipy dependency: Pure PyTorch implementation
+# 
+# FULL STATE REPRESENTATION (Scientific Research):
+#   - Uses ALL MPM particle positions (no dimensionality reduction)
+#   - State dimension determined dynamically from environment
+#   - Complete physics information with zero approximation
+# 
+# WARNING: Computationally expensive! High-dimensional optimization.
+
+algo: TrueDMSMPCAgent
+
+name: "true_dms"
+class_name: "TrueDMSMPCAgent"
+
+network:
+  name: "true_dms_mpc"
+
+params:
+  num_actors: 1
+  max_agent_steps: 1000
+  render_results: false  # Set to true to replay saved trajectory
+
+dms_mpc_params:
+    # ========== Horizon Parameters ==========
+    N: 8  # Number of shooting nodes
+          # With 7783D state (2592 particles), start SMALL!
+          # N=3: ~23,358 decision variables (Adam handles this well)
+          # N=5: ~38,930 decision variables (feasible with Adam)
+          # N=8: ~62,288 decision variables (possible but slow)
+          # Recommendation: Start with N=3-5, Adam scales better than SLSQP
+    
+    timesteps: 20  # Total MPC steps to execute
+                  # Start with 3 timesteps to test convergence
+                  # Each step: 2-5 minutes with N=3, max_iter=100
+                  # Total time: 6-15 minutes for 3 timesteps
+                  # Increase after confirming good convergence
+    
+    # ========== Optimization Parameters (PyTorch Adam) ==========
+    max_iter: 100  # Max Adam iterations per MPC step
+                   # Recommendation: 50-200 iterations
+                   # More iterations = better convergence but slower
+                   # Each iteration: N simulations (one per shooting interval)
+    
+    learning_rate: 0.005  # Adam optimizer learning rate
+                         # Higher = faster convergence but may overshoot
+                         # Lower = slower but more stable
+                         # Typical range: 0.001 - 0.1
+                         # Start with 0.01, reduce if unstable
+    
+    penalty_weight: 100.0  # Penalty weight for constraint violations
+                            # Higher = constraints satisfied better, harder optimization
+                            # Lower = easier optimization, may violate constraints
+                            # Typical range: 100 - 10000
+                            # Start with 1000, increase if constraints violated
+    
+    # ========== State/Control Dimensions ==========
+    # State dimension: Determined DYNAMICALLY from environment
+    #   - Uses ALL MPM particle positions + rigid body configuration
+    #   - For RollingPin: 2592 particles × 3 + 7 body_q = 7783D state
+    #     * 7776D for particle positions [x, y, z] × 2592
+    #     * 7D for body configuration [x, y, z, qw, qx, qy, qz]
+    #   - Dimensions auto-detected from full simulation state (NOT observations)
+    #   - NOTE: Observations are downsampled to 250, but we use all 2592 for TRUE DMS
+    
+    # Control dimension: FIXED at 3D for RollingPin
+    #   - [dx, dy, ry] matching environment action space
+    #   - Hardcoded in dmsmpc_true.py
+    #   - Bounds: [-1, 1] enforced via clipping during optimization
+    
+    # ========== Cost Function Weights ==========
+    cost_state: 1.0       # Weight for state cost ||x||²
+                          # Higher = try harder to reach origin/target
+    
+    cost_control: 0.01    # Weight for control cost ||u||²
+                          # Higher = prefer smaller control inputs
+                          # Typical: 0.001 - 0.1
+                          # Should be << cost_state
+    
+    cost_terminal: 10.0   # Weight for terminal state cost ||x_N||²
+                          # Higher = emphasize final state
+                          # Typical: 5 - 20
+                          # Should be > cost_state
+
+# =============================================================================
+# PERFORMANCE EXPECTATIONS (PyTorch Adam)
+# =============================================================================
+#
+# Full State Representation (2592 particles = 7783D state including body_q):
+#   - Decision variables per step: (7783 + 3) × N ≈ 23,358 vars for N=3
+#   - Penalty terms: Initial state + N dynamics penalties
+#   - This is EXTREMELY HIGH-DIMENSIONAL optimization!
+#
+# Expected performance with N=3, timesteps=3, max_iter=100:
+#   - Time per MPC step: 100-300 seconds (2-5 minutes)
+#   - Total time: 6-15 minutes for 3 timesteps
+#   - Simulations per step: N × max_iter = 300 (1 per iteration per interval)
+#   - Adam iterations per step: 100
+#
+# Compared to scipy SLSQP:
+#   - Faster per iteration: No Jacobian computation (O(n) vs O(n²))
+#   - More iterations needed: First-order only (Adam vs second-order SLSQP)
+#   - Better scalability: Handles high dimensions better
+#   - Approximate constraints: Penalty method vs hard constraints
+#
+# Memory requirements:
+#   - Optimization variables: ~200-500 MB (decision variables + gradients)
+#   - Each simulation state: ~30-50 MB (all 2592 particles)
+#   - Total GPU memory: Expect 2-5 GB usage (much less than SLSQP!)
+#
+# CRITICAL RECOMMENDATIONS:
+#   - Start with N=3, timesteps=3, max_iter=100 to test feasibility
+#   - Monitor loss convergence: should decrease steadily
+#   - Tune penalty_weight if constraints violated
+#   - This is for RESEARCH ONLY - not practical for real-time control
+
+# =============================================================================
+# TUNING GUIDE (PyTorch Adam)
+# =============================================================================
+#
+# If too slow:
+#   1. Reduce N to 3 (fewer shooting nodes = fewer simulations per iteration)
+#   2. Reduce timesteps to 3 (fewer MPC steps)
+#   3. Reduce max_iter to 50 (fewer Adam iterations)
+#   4. Increase learning_rate to 0.05 (faster convergence, but may be unstable)
+#   5. Note: State dim is 7783 (all 2592 particles), CANNOT reduce
+#
+# If loss not decreasing (poor convergence):
+#   1. Reduce learning_rate to 0.001 (more stable, slower)
+#   2. Increase max_iter to 200-500 (give Adam more iterations)
+#   3. Check warm start: initialized with current state
+#   4. Adjust cost weights:
+#      - Reduce cost_state (less aggressive state minimization)
+#      - Increase cost_control (smoother controls)
+#      - Reduce penalty_weight (easier problem, but constraints may be violated)
+#
+# If constraints violated (dynamics not satisfied):
+#   1. Increase penalty_weight to 5000-10000 (enforce constraints harder)
+#   2. Increase max_iter (more iterations for penalty method)
+#   3. Reduce learning_rate (more careful optimization)
+#   4. Check if loss is still decreasing (may need more iterations)
+#   5. Note: Penalty method gives approximate satisfaction (not exact)
+#
+# If optimization unstable (loss oscillating):
+#   1. Reduce learning_rate to 0.001-0.005 (critical!)
+#   2. May need gradient clipping (modify code)
+#   3. Check for numerical issues in simulation
+#   4. Reduce penalty_weight if too large
+#
+# If controls hitting bounds frequently:
+#   1. Increase cost_control (penalize large controls more)
+#   2. Controls are clipped to [-1, 1] automatically
+#   3. Consider smoother cost function
+
+# =============================================================================
+# WHEN TO USE THIS FULL-STATE TRUE DMS (PyTorch Adam)
+# =============================================================================
+#
+# ✅ Use FULL-STATE TRUE DMS with Adam for:
+#   - Scientific research requiring complete physics representation
+#   - Studies where dimensionality reduction may hide important dynamics
+#   - Investigating high-dimensional first-order optimization in MPC
+#   - Benchmarking penalty methods vs constrained optimization
+#   - When you need EXACT particle-level control
+#   - When scipy dependency is undesirable
+#
+# ⚠️  Considerations:
+#   - Very high dimensional: 7783D state (2592 particles × 3 + 7 body_q)
+#   - Penalty method: Constraints satisfied approximately (not exactly)
+#   - Requires tuning: learning_rate, penalty_weight, max_iter
+#   - More iterations than SLSQP but faster per iteration
+#   - Memory efficient: O(n) gradients instead of O(n²) Jacobian
+#
+# 💡 Advantages over Scipy SLSQP:
+#   - Faster per iteration: No Jacobian computation
+#   - Better scalability: Handles high dimensions better
+#   - Pure PyTorch: No scipy dependency
+#   - Easier to modify: Standard PyTorch optimization loop
+#
+# 💡 Practical Alternative:
+#   - For faster iteration, consider reduced-order models (PCA, COM, joints)
+#   - Single shooting is 10-20× faster for stable dynamics
+#   - This full-state version is for when accuracy >> speed
+

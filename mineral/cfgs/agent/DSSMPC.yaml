@@ -1,0 +1,137 @@
+# Configuration for Single Shooting MPC
+# Optimizes control sequence u = [u0, ..., u_{N-1}] to maximize cumulative reward
+# 
+# SINGLE SHOOTING ALGORITHM:
+#   for timesteps:
+#       u = single_shooting(xk, u_init)   # optimize controls via Adam
+#       env.step(u[0])                    # execute first control
+#       u_init = [u1, ..., u_{N-1}, u_{N-1}]  # warm start shift
+#
+# KEY FEATURES:
+#   - Optimizer: PyTorch Adam (first-order gradient descent)
+#   - Loss: -cumulative_reward (maximize reward via differentiable simulation)
+#   - Dynamics: Implicitly satisfied via simulation rollout
+#   - Warm Starting: Shift control sequence between timesteps
+#   - No constraint penalties needed (unlike DMS)
+
+algo: DSSMPCAgent
+
+name: "dssmpc"
+class_name: "DSSMPCAgent"
+
+network:
+  name: "dssmpc_mpc"
+
+params:
+  num_actors: 1
+  max_agent_steps: 1000
+  render_results: false  # Set to true to replay saved trajectory
+
+dss_mpc_params:
+    # ========== Horizon Parameters ==========
+    N: 8  # Number of control steps in horizon
+          # Single shooting optimizes N control inputs: [u0, ..., u_{N-1}]
+          # Decision variables: N × control_dim (e.g., 8 × 3 = 24 for RollingPin)
+          # Much smaller than DMS! (DMS would have N × (state_dim + control_dim))
+          # Can use larger N since optimization is low-dimensional
+    
+    timesteps: 50  # Total MPC steps to execute
+                   # Each timestep: plan horizon, execute u[0], shift warm start
+    
+    # ========== Optimization Parameters (PyTorch Adam) ==========
+    max_iter: 75  # Max Adam iterations per MPC planning step
+                   # Each iteration: 1 full rollout of N simulation steps
+                   # Total simulations per planning: max_iter × N
+                   # Recommendation: 50-200 iterations
+    
+    learning_rate: 0.01  # Adam optimizer learning rate
+                         # Higher = faster convergence but may overshoot
+                         # Lower = slower but more stable
+                         # Typical range: 0.001 - 0.1
+                         # Start with 0.01, adjust based on convergence
+    
+    # ========== Cost Function Weights (used by DMS, not single shooting) ==========
+    # Single shooting uses environment reward directly
+    # These are kept for DMS compatibility
+    cost_state: 1.0       # Weight for state cost (DMS only)
+    cost_control: 0.01    # Weight for control cost (DMS only)
+    cost_terminal: 10.0   # Weight for terminal cost (DMS only)
+    penalty_weight: 100.0  # Constraint penalty weight (DMS only)
+
+# =============================================================================
+# PERFORMANCE EXPECTATIONS (Single Shooting)
+# =============================================================================
+#
+# Single Shooting is MUCH faster than DMS because:
+#   - Only optimizes controls: N × control_dim variables (e.g., 24 for N=8, 3D control)
+#   - No state variables to optimize (dynamics satisfied implicitly)
+#   - No constraint penalties to compute
+#   - Simple loss: just accumulated reward from rollout
+#
+# Expected performance with N=8, timesteps=20, max_iter=100:
+#   - Simulations per planning step: max_iter × N = 800
+#   - Time per planning step: ~10-60 seconds (depends on simulation speed)
+#   - Total time: ~3-20 minutes for 20 timesteps
+#
+# Memory requirements:
+#   - Very low: Only N × control_dim optimization variables
+#   - Gradients flow through N simulation steps (backprop through time)
+#   - GPU memory dominated by simulation state, not optimization
+#
+# RECOMMENDATIONS:
+#   - Start with N=8, max_iter=100
+#   - Monitor reward improvement during optimization
+#   - Increase N for longer-horizon planning
+#   - Warm starting significantly speeds up convergence
+
+# =============================================================================
+# TUNING GUIDE (Single Shooting)
+# =============================================================================
+#
+# If too slow:
+#   1. Reduce max_iter to 50 (fewer optimization iterations)
+#   2. Reduce N (shorter horizon = fewer simulations per iteration)
+#   3. Increase learning_rate to 0.05 (faster but may be unstable)
+#
+# If reward not improving (poor convergence):
+#   1. Reduce learning_rate to 0.001-0.005 (more stable)
+#   2. Increase max_iter to 200-500 (more iterations to converge)
+#   3. Check that warm starting is working (should improve over timesteps)
+#   4. Verify gradients are flowing (reward should change with controls)
+#
+# If optimization unstable (reward oscillating):
+#   1. Reduce learning_rate to 0.001 (critical!)
+#   2. Check for numerical issues in simulation
+#   3. Try smaller N (shorter gradient chain)
+#
+# If controls saturating at bounds:
+#   1. This is often fine - indicates strong gradients
+#   2. Controls are clipped to [-1, 1] after each step
+#   3. Consider if task requires large controls
+
+# =============================================================================
+# SINGLE SHOOTING vs DMS
+# =============================================================================
+#
+# ✅ Use SINGLE SHOOTING (default) when:
+#   - Speed is important
+#   - Dynamics are stable and differentiable
+#   - Environment provides good reward signal
+#   - You want simple, effective MPC
+#
+# ✅ Use DMS (run_dms_mpc) when:
+#   - Need to optimize state trajectory explicitly
+#   - Studying constraint satisfaction methods
+#   - Comparing shooting methods for research
+#
+# Single Shooting Advantages:
+#   - 10-100× fewer optimization variables
+#   - No constraint penalties to tune
+#   - Simpler implementation
+#   - Warm starting works naturally
+#
+# DMS Advantages:
+#   - Can handle unstable dynamics better
+#   - Explicit state trajectory for analysis
+#   - Can add state constraints via penalties
+

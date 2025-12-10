@@ -1,0 +1,140 @@
+# Example Configuration for TRUE Direct Multiple Shooting MPC
+# 
+# This config demonstrates how to use the true DMS implementation.
+# Copy and modify for your specific environment.
+
+agent:
+  name: "dmsmpc_true"
+  
+  network:
+    # Network config (if needed)
+    hidden_dim: 256
+  
+  params:
+    num_actors: 1              # Number of parallel environments (usually 1 for MPC)
+    max_agent_steps: 1000      # Max steps per episode
+    render_results: false      # Set to true to replay saved trajectory
+  
+  dms_mpc_params:
+    # ========== Core Parameters ==========
+    N: 8                       # Number of shooting nodes (horizon length)
+                               # Recommendation: Start with 8-10, reduce if too slow
+                               # TRUE DMS is expensive: each MPC step takes ~30-60s with N=8
+    
+    timesteps: 20              # Number of MPC steps to execute
+                               # Recommendation: Start small (10-20) to test
+                               # TRUE DMS will take ~10-30 minutes for 20 steps
+    
+    max_iter: 15               # Max SLSQP iterations per MPC step
+                               # Recommendation: 10-20 is usually sufficient
+                               # More iterations = slower but potentially better solutions
+    
+    # ========== State/Control Dimensions ==========
+    state_dim: 6               # Dimension of reduced state
+                               # For RollingPin: [joint_q (3), com_q (3)] = 6
+                               # For CartPole: [x, theta, x_dot, theta_dot] = 4
+    
+    control_dim: 3             # Dimension of control input
+                               # For RollingPin: [dx, dy, ry] = 3
+                               # Check your environment's action space
+    
+    # ========== State Setting Strategy ==========
+    state_setting_strategy: 'joint_only'  
+    # Options:
+    #   'joint_only'  - Only set joint positions, ignore COM (RECOMMENDED)
+    #                   Pros: Fast, stable, reliable
+    #                   Cons: Can't directly control COM
+    #
+    #   'joint_com'   - Set joints + translate MPM particles for COM (EXPERIMENTAL)
+    #                   Pros: Full state control
+    #                   Cons: Slow, may be unstable, expensive
+    #
+    # Recommendation: Always start with 'joint_only'
+    
+    # ========== Cost Function Weights ==========
+    cost_state: 1.0            # Weight for state cost ||x||²
+                               # Higher = try harder to reach origin/target state
+    
+    cost_control: 0.01         # Weight for control cost ||u||²
+                               # Higher = prefer smaller control inputs (energy efficiency)
+                               # Typical: 0.001 - 0.1
+    
+    cost_terminal: 10.0        # Weight for terminal state cost ||x_N||²
+                               # Higher = emphasize final state more than intermediate states
+                               # Typical: 5 - 20 (should be > cost_state)
+
+# ========== Environment Configuration ==========
+env:
+  name: "RollingPinPlasticineLab"  # Your environment name
+  
+  # Environment-specific parameters
+  dt: 0.033333                 # Physics timestep (1/30 seconds)
+  num_envs: 1                  # Should match num_actors
+  
+  # Other env params as needed
+
+# ========== Tips for Tuning ==========
+#
+# 1. START SMALL:
+#    - N = 5-8 nodes (not 20!)
+#    - timesteps = 10-20 (not 100!)
+#    - max_iter = 10-15 (not 50!)
+#
+# 2. MONITOR PERFORMANCE:
+#    - Each MPC step will print optimization statistics
+#    - Watch "Constraint evals" - should be 100-300
+#    - If > 500, reduce max_iter or N
+#
+# 3. IF TOO SLOW:
+#    - Reduce N (most impactful)
+#    - Reduce max_iter
+#    - Switch to 'dmsmpc_scipy_autodiff' instead
+#
+# 4. IF NOT CONVERGING:
+#    - Check state_dim and control_dim match your environment
+#    - Try 'joint_only' strategy if using 'joint_com'
+#    - Increase max_iter to 20-30
+#    - Adjust cost weights (increase cost_terminal)
+#
+# 5. IF CONSTRAINTS VIOLATED:
+#    - This is normal during optimization
+#    - Check final "Success: True" message
+#    - If Success: False, try different initialization
+#
+# ========== Expected Performance ==========
+#
+# Typical TRUE DMS performance (N=8, RollingPin):
+#   - Time per MPC step: 30-60 seconds
+#   - Total time (20 steps): 10-30 minutes
+#   - Constraint evals per step: 150-250
+#   - Function evals per step: 15-25
+#
+# Compare with Single Shooting (dmsmpc_scipy_autodiff):
+#   - Time per MPC step: 3-5 seconds (10-20x faster!)
+#   - Usually similar or slightly worse reward
+#
+# Recommendation: Try single shooting first!
+
+# ========== Debugging ==========
+#
+# Common issues:
+#
+# 1. "Cannot set state" errors:
+#    - Check state_setting_strategy is 'joint_only'
+#    - Verify state_dim matches observation space
+#
+# 2. Very slow:
+#    - Reduce N to 5
+#    - Reduce timesteps to 10
+#    - Check you're on GPU (not CPU)
+#
+# 3. "Positive directional derivative":
+#    - Normal for some iterations
+#    - If persistent, constraints may be infeasible
+#    - Try joint_only strategy
+#
+# 4. No improvement over random:
+#    - Check cost_terminal > cost_state
+#    - Verify control_dim matches action space
+#    - Try increasing max_iter
+

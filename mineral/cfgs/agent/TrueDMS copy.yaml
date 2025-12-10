@@ -1,0 +1,139 @@
+# Configuration for TRUE Direct Multiple Shooting MPC
+# This implements proper DMS with independent shooting nodes
+# 
+# FULL STATE REPRESENTATION (Scientific Research):
+#   - Uses ALL MPM particle positions (no dimensionality reduction)
+#   - State dimension determined dynamically from environment
+#   - Complete physics information with zero approximation
+# 
+# WARNING: Computationally expensive! High-dimensional optimization.
+
+algo: TrueDMSMPCAgent
+
+name: "true_dms"
+class_name: "TrueDMSMPCAgent"
+
+network:
+  name: "true_dms_mpc"
+
+params:
+  num_actors: 1
+  max_agent_steps: 1000
+  render_results: false  # Set to true to replay saved trajectory
+
+dms_mpc_params:
+    # ========== Horizon Parameters ==========
+    N: 8  # Number of shooting nodes
+          # Recommendation: Start with 5-8 for testing
+          # TRUE DMS is expensive: each node requires independent simulation
+          # Reduce to 5 for faster testing, increase to 10 for better performance
+    
+    timesteps: 20  # Total MPC steps to execute
+                   # Recommendation: Start with 10-20 for testing
+                   # Each step takes 30-60s with N=8
+                   # Total time: timesteps × 30-60s ≈ 10-30 minutes
+    
+    # ========== Optimization Parameters ==========
+    max_iter: 15  # Max SLSQP iterations per MPC step
+                  # Recommendation: 10-20 is usually sufficient
+                  # More iterations = slower but potentially better solutions
+                  # Each iteration: ~10-20 constraint evaluations × N simulations
+    
+    # ========== State/Control Dimensions ==========
+    # State dimension: Determined DYNAMICALLY from environment
+    #   - Uses ALL MPM particle positions (no dimensionality reduction)
+    #   - For RollingPin: ~250 particles (downsampled) × 3 = 750D state
+    #   - Full particles: ~2592 particles × 3 = 7776D state
+    #   - Dimensions auto-detected from first observation
+    
+    # Control dimension: FIXED at 3D for RollingPin
+    #   - [dx, dy, ry] matching environment action space
+    #   - Hardcoded in dmsmpc_true.py
+    
+    # ========== Cost Function Weights ==========
+    cost_state: 1.0       # Weight for state cost ||x||²
+                          # Higher = try harder to reach origin/target
+    
+    cost_control: 0.01    # Weight for control cost ||u||²
+                          # Higher = prefer smaller control inputs
+                          # Typical: 0.001 - 0.1
+                          # Should be << cost_state
+    
+    cost_terminal: 10.0   # Weight for terminal state cost ||x_N||²
+                          # Higher = emphasize final state
+                          # Typical: 5 - 20
+                          # Should be > cost_state
+
+# =============================================================================
+# PERFORMANCE EXPECTATIONS
+# =============================================================================
+#
+# Full State Representation (~250 particles = 750D state):
+#   - Decision variables per step: (750 + 3) × N ≈ 6024 vars for N=8
+#   - Constraint equations: 751 × (N+1) = 6759 constraints for N=8
+#   - This is HIGH-DIMENSIONAL optimization!
+#
+# Expected performance with N=8, timesteps=20, 750D state:
+#   - Time per MPC step: 60-180 seconds (depends on SLSQP convergence)
+#   - Total time: 20-60 minutes
+#   - Constraint evaluations per step: 100-300
+#   - Simulations per step: N × constraint_evals = 800-2400
+#
+# Memory requirements:
+#   - Optimization problem: ~50-100 MB
+#   - Each simulation state: ~5-10 MB (all particles)
+#   - Total GPU memory: Expect 2-4 GB usage
+#
+# RECOMMENDATION:
+#   - Start with small N (3-5) to verify convergence
+#   - Use reduced timesteps (5-10) for initial testing
+#   - Monitor SLSQP convergence carefully
+
+# =============================================================================
+# TUNING GUIDE
+# =============================================================================
+#
+# If too slow (high-dimensional problem):
+#   1. Reduce N to 3-5 (MOST impactful - reduces vars and constraints)
+#   2. Reduce timesteps to 5-10 (for testing)
+#   3. Reduce max_iter to 10 (fewer SLSQP iterations)
+#   4. Note: State dim is fixed (all particles), can't reduce
+#
+# If not converging (SLSQP fails):
+#   1. Start with smaller N (3-5) to ensure feasibility
+#   2. Increase max_iter to 20-30 (give SLSQP more iterations)
+#   3. Adjust cost weights:
+#      - Reduce cost_state (less aggressive state minimization)
+#      - Increase cost_control (smoother controls)
+#   4. Check warm start initialization is reasonable
+#
+# If constraints violated at convergence:
+#   1. Constraint violations are normal DURING optimization
+#   2. Check final "Success: True" message from SLSQP
+#   3. If Success: False, the problem may be infeasible:
+#      - Reduce N (shorter horizon)
+#      - Adjust cost weights
+#      - Check initial state is valid
+
+# =============================================================================
+# WHEN TO USE THIS FULL-STATE TRUE DMS
+# =============================================================================
+#
+# ✅ Use FULL-STATE TRUE DMS for:
+#   - Scientific research requiring complete physics representation
+#   - Studies where dimensionality reduction may hide important dynamics
+#   - Investigating high-dimensional optimization in MPC
+#   - Benchmarking against reduced-order methods
+#   - When you need EXACT particle-level control
+#
+# ⚠️  Considerations:
+#   - Very high dimensional: ~750D state (250 particles × 3)
+#   - Slow convergence: SLSQP with thousands of constraints
+#   - May require careful tuning of N, max_iter, cost weights
+#   - Memory intensive: stores full particle states at each node
+#
+# 💡 Practical Alternative:
+#   - For faster iteration, consider reduced-order models (PCA, COM, joints)
+#   - Single shooting is 10-20× faster for stable dynamics
+#   - This full-state version is for when accuracy >> speed
+

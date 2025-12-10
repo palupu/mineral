@@ -1,10 +1,11 @@
-"""DMS MPC using scipy optimizers with automatic differentiation.
+"""DMS MPC using SLSQP optimizer with automatic differentiation.
 
 This combines the best of both worlds:
-- scipy's robust NLP solvers (L-BFGS-B, SLSQP, trust-constr)
+- SLSQP's robust constrained optimization
 - PyTorch's automatic differentiation through physics
 
-Key insight: scipy optimizers can accept user-provided gradients via jac=callable
+Key insight: SLSQP can accept user-provided gradients via jac=True,
+and we compute exact gradients through differentiable physics simulation.
 """
 
 import time
@@ -17,13 +18,15 @@ from mineral.agents.agent import Agent
 
 
 class DMSMPCScipyAutodiffAgent(Agent):
-    r"""DMS MPC using scipy optimizers with PyTorch autodiff gradients.
+    r"""DMS MPC using SLSQP optimizer with PyTorch autodiff gradients.
 
-    This implementation demonstrates that scipy optimizers work great with
-    differentiable physics. We get:
-    - Exact gradients from PyTorch autodiff
-    - Robust optimization from scipy (L-BFGS-B, SLSQP, etc.)
-    - No need for finite differences
+    SLSQP (Sequential Least Squares Programming) is a robust gradient-based
+    optimizer for constrained nonlinear optimization. Combined with PyTorch's
+    automatic differentiation through physics, we get:
+    - Exact gradients via backpropagation through the simulator
+    - Efficient bound-constrained optimization
+    - No finite differences or numerical approximations
+    - Single rollout per iteration (cost + gradient computed together)
     """
 
     def __init__(self, full_cfg, **kwargs):
@@ -44,17 +47,13 @@ class DMSMPCScipyAutodiffAgent(Agent):
         self.cost_control = self.dms_mpc_params.cost_control
         self.cost_terminal = self.dms_mpc_params.cost_terminal
 
-        # Scipy optimizer selection
-        self.scipy_method = self.dms_mpc_params.get('scipy_method', 'L-BFGS-B')
-        # Options: 'L-BFGS-B', 'SLSQP', 'trust-constr', 'TNC'
-
         # Derived parameters - determine dynamically from environment
         # These will be set after super().__init__ when self.env is available
         self.state_dim = None
         self.control_dim = None
 
         super().__init__(full_cfg, **kwargs)
-        
+
         # Now that self.env is available, determine dimensions dynamically
         self._determine_dimensions()
 
@@ -69,13 +68,13 @@ class DMSMPCScipyAutodiffAgent(Agent):
         """Determine state and control dimensions dynamically from environment."""
         # Get control dimension from environment action space
         self.control_dim = self.env.action_space.shape[0]
-        
+
         # Determine state dimension from observation space
         if hasattr(self.env.observation_space, 'spaces') and isinstance(self.env.observation_space.spaces, dict):
             # For dict observation spaces (like RollingPin), determine state dimension
             # by looking at the observation structure
             obs_space = self.env.observation_space.spaces
-            
+
             # For RollingPin: joint_q (3) + com_q (3) = 6
             if 'joint_q' in obs_space and 'com_q' in obs_space:
                 joint_dim = obs_space['joint_q'].shape[0] if len(obs_space['joint_q'].shape) > 0 else 1
@@ -83,16 +82,16 @@ class DMSMPCScipyAutodiffAgent(Agent):
                 self.state_dim = joint_dim + com_dim
             else:
                 # Fallback: use total observation dimension
-                total_dim = sum(space.shape[0] if len(space.shape) > 0 else 1 
+                total_dim = sum(space.shape[0] if len(space.shape) > 0 else 1
                               for space in obs_space.values())
                 self.state_dim = total_dim
         else:
             # For simple observation spaces
             self.state_dim = self.env.observation_space.shape[0]
-        
+
         print(f"Auto-detected dimensions: state_dim={self.state_dim}, control_dim={self.control_dim}")
         print(f"Environment info: env.num_envs={self.env.num_envs}, agent.num_actors={self.num_actors}")
-        
+
         # Override with config values if they exist (for backward compatibility)
         if hasattr(self.dms_mpc_params, 'state_dim') and self.dms_mpc_params.state_dim is not None:
             self.state_dim = self.dms_mpc_params.state_dim
@@ -101,16 +100,28 @@ class DMSMPCScipyAutodiffAgent(Agent):
             self.control_dim = self.dms_mpc_params.control_dim
             print(f"Using config control_dim: {self.control_dim}")
 
-    def _obs_to_state(self, obs):
-        """Convert observation to state tensor."""
+    def _obs_to_state(self, obs, detach=False):
+        """Convert observation to state tensor.
+
+        Args:
+            obs: Observation from environment
+            detach: If True, detach from computational graph (for non-gradient operations)
+        """
         if isinstance(obs, dict):
             joint_q = obs.get('joint_q', torch.zeros(3, device=self.device))
             com_q = obs.get('com_q', torch.zeros(3, device=self.device))
+
+            # Detach if requested to break computational graph
+            if detach:
+                joint_q = joint_q.detach() if isinstance(joint_q, torch.Tensor) else joint_q
+                com_q = com_q.detach() if isinstance(com_q, torch.Tensor) else com_q
+
             state = torch.cat([joint_q.flatten(), com_q.flatten()])
             return state[: self.state_dim]
 
         if isinstance(obs, torch.Tensor):
-            return obs[: self.state_dim]
+            obs_tensor = obs.detach() if detach else obs
+            return obs_tensor[: self.state_dim]
 
         return torch.tensor(obs[: self.state_dim], device=self.device, dtype=torch.float32)
 
@@ -135,9 +146,10 @@ class DMSMPCScipyAutodiffAgent(Agent):
             cost: Scalar cost value (numpy float)
             grad: Gradient w.r.t. controls (numpy array) or None
         """
-        # Restore environment state
-        self.env.state_0 = saved_state
-        
+        # Restore environment state before rollout using environment's built-in method
+        # This properly detaches from any previous computational graphs
+        self.env.clear_grad(checkpoint=saved_state)
+
         # Convert numpy to torch with gradient tracking
         if compute_gradients:
             controls_flat = torch.tensor(controls_np, device=self.device, dtype=torch.float32, requires_grad=True)
@@ -180,37 +192,29 @@ class DMSMPCScipyAutodiffAgent(Agent):
 
         # Extract cost
         cost_value = total_cost.item()
-        
+
         # Compute gradients if requested
         if compute_gradients:
             # Backpropagate to get gradients
             total_cost.backward()
-            grad_value = controls_flat.grad.cpu().numpy()
+            grad_value = controls_flat.grad.detach().cpu().numpy()
+
+            # Clear gradients to prevent accumulation across optimization iterations
+            controls_flat.grad = None
         else:
             grad_value = None
 
         return cost_value, grad_value
 
-    def cost_function(self, controls_np):
-        """Cost function for scipy (returns only cost)."""
-        cost, _ = self.rollout_and_cost(controls_np, self._saved_state, compute_gradients=False)
-        
-        # Increment iteration counter and print for monitoring
-        self._iter_count += 1
-        print(f"    Iter {self._iter_count}: Cost={cost:.6f}", flush=True)
-        
-        return cost
-
-    def gradient_function(self, controls_np):
-        """Gradient function for scipy (returns only gradient)."""
-        _, grad = self.rollout_and_cost(controls_np, self._saved_state, compute_gradients=True)
-        return grad
-
     def cost_and_gradient(self, controls_np):
-        """Combined function that returns both cost and gradient.
+        """Combined cost and gradient function optimized for SLSQP.
 
-        This is more efficient than separate calls because we only
-        do one forward+backward pass.
+        SLSQP efficiently handles functions that return both cost and gradient
+        in a single call (jac=True), avoiding redundant rollouts.
+
+        Returns:
+            cost: Scalar cost value
+            grad: Gradient array of same shape as controls_np
         """
         cost, grad = self.rollout_and_cost(controls_np, self._saved_state, compute_gradients=True)
 
@@ -221,41 +225,52 @@ class DMSMPCScipyAutodiffAgent(Agent):
         return cost, grad
 
     def dms_plan(self, current_state):
-        """Plan using scipy optimizer with autodiff gradients."""
-        # Initialize controls (flattened)
+        """Plan using SLSQP optimizer with autodiff gradients.
+
+        SLSQP (Sequential Least Squares Programming) is a robust gradient-based
+        optimizer that handles bound constraints efficiently. We use it with
+        PyTorch autodiff to get exact gradients through the physics simulation.
+        """
+        # Initialize controls (flattened to 1D array for scipy)
         controls_init = np.zeros(self.N * self.control_dim)
 
-        # Define bounds (repeated for each control at each node)
-        bounds = [(self.action_lower[j], self.action_upper[j]) for _ in range(self.N) for j in range(self.control_dim)]
+        # Define bounds for each control variable at each horizon step
+        bounds = [(self.action_lower[j], self.action_upper[j])
+                  for _ in range(self.N)
+                  for j in range(self.control_dim)]
 
-        # Save environment state - store as instance variable so cost/grad functions can access it
-        self._saved_state = self.env.state_0
-        
+        # Save environment state using environment's checkpoint system
+        # This ensures each rollout starts fresh without sharing computational graphs
+        self._saved_state = self.env.get_checkpoint(detach=True)
+
         # Initialize iteration counter for progress tracking
         self._iter_count = 0
 
+        # Run SLSQP optimization with combined cost and gradient
+        # jac=True tells scipy that the function returns (cost, gradient)
         result = minimize(
-            fun=self.cost_function,
+            fun=self.cost_and_gradient,
             x0=controls_init,
             method='SLSQP',
-            jac=self.gradient_function,  # Separate gradient function
+            jac=True,  # Function returns both cost and gradient
             bounds=bounds,
-            options={'maxiter': self.max_iter, 'ftol': 1e-6, 'disp': False},
+            options={
+                'maxiter': self.max_iter,
+                'ftol': 1e-6,  # Function tolerance
+                'disp': False,  # Don't print scipy's own progress
+            },
         )
 
-        # Restore environment state
-        self.env.state_0 = self._saved_state
-
-        # Extract optimal action
+        # Extract optimal control sequence
         optimal_controls = result.x.reshape(self.N, self.control_dim)
-        optimal_action = optimal_controls[0]
+        optimal_action = optimal_controls[0]  # MPC: execute only first action
 
         # Print optimization summary
-        print(f"\n  ✓ Optimization complete!", flush=True)
+        print("\n  ✓ Optimization complete!", flush=True)
         print(f"    Success: {result.success} | Message: {result.message}", flush=True)
-        print(f"    Final cost: {result.fun:.6f} | Total iterations: {result.nit}", flush=True)
+        print(f"    Final cost: {result.fun:.6f} | Iterations: {result.nit}", flush=True)
         print(f"    Optimal action (first step): {optimal_action}", flush=True)
-        print(f"    Function evals: {result.nfev} | Gradient evals: {result.njev if hasattr(result, 'njev') else 'N/A'}", flush=True)
+        print(f"    Function evals: {result.nfev} | Gradient evals: {result.njev}", flush=True)
 
         return torch.tensor(optimal_action, device=self.device, dtype=torch.float32)
 
@@ -270,10 +285,10 @@ class DMSMPCScipyAutodiffAgent(Agent):
         best_actions_list = []
 
         print(f"\n{'='*60}", flush=True)
-        print(f"=== Starting DMS MPC with Scipy + Autodiff ===", flush=True)
+        print("=== Starting DMS MPC with SLSQP + Autodiff ===", flush=True)
         print(f"  State dim: {self.state_dim}, Control dim: {self.control_dim}", flush=True)
         print(f"  Horizon (N): {self.N}, Total timesteps: {self.timesteps}", flush=True)
-        print(f"  Optimizer: {self.scipy_method}, Max iter per step: {self.max_iter}", flush=True)
+        print(f"  Optimizer: SLSQP, Max iter per step: {self.max_iter}", flush=True)
         print(f"  Cost weights - State: {self.cost_state}, Control: {self.cost_control}, Terminal: {self.cost_terminal}", flush=True)
         print(f"{'='*60}\n", flush=True)
 
@@ -286,8 +301,8 @@ class DMSMPCScipyAutodiffAgent(Agent):
             print(f"Timestep {timestep + 1}/{self.timesteps}", flush=True)
 
             current_state = self._obs_to_state(obs)
-            # what is this? do i need this
-            saved_env_state = self.env.state_0
+            # Save state before optimization (will be modified during planning)
+            saved_env_state = self.env.get_checkpoint(detach=True)
 
             # Enable gradients temporarily
             with torch.enable_grad():
@@ -298,8 +313,8 @@ class DMSMPCScipyAutodiffAgent(Agent):
 
                 self.env.no_grad = original_no_grad
 
-            # Restore and execute
-            self.env.state_0 = saved_env_state
+            # Restore state and execute optimal action
+            self.env.clear_grad(checkpoint=saved_env_state)
             # Shape should be (1, action_dim) for one environment
             actions = optimal_action.unsqueeze(0)
             obs, reward, done, info = self.env.step(actions)
@@ -313,7 +328,7 @@ class DMSMPCScipyAutodiffAgent(Agent):
             print(f"    Reward: {reward[0]:.4f} | Cumulative reward: {total_reward:.4f}", flush=True)
 
         print(f"\n{'='*60}", flush=True)
-        print(f"=== Evaluation Complete ===", flush=True)
+        print("=== Evaluation Complete ===", flush=True)
         print(f"  Total reward: {total_reward:.4f}", flush=True)
         print(f"  Total timesteps: {len(best_actions_list)}", flush=True)
         print(f"  Average reward per step: {total_reward / len(best_actions_list):.4f}", flush=True)

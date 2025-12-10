@@ -343,52 +343,6 @@ class TrueDMSMPCAgent(Agent):
         if has_body_q:
             body_q_vec = state_vec_torch[idx:idx + body_q_dim]
             new_state.body_q.assign(wp.from_torch(body_q_vec.unsqueeze(0)))  # Add batch dimension
-
-            # IMPORTANT: Also set joint_q if it exists in the state
-            # For articulated systems (like RollingPin with D6 joint), joint_q is the
-            # independent variable and body_q is derived from it via forward kinematics.
-            # When setting body_q directly, we need to also set joint_q to maintain consistency.
-            if hasattr(new_state, 'joint_q') and new_state.joint_q is not None:
-                # Extract joint_q from body_q transform
-                # For D6 joint: joint_q = [x, y, rotation_y]
-                # body_q format: [x, y, z, qw, qx, qy, qz] (7D vector from transform)
-                body_q_torch = body_q_vec  # Shape: (7,)
-
-                # Extract position (x, y) - first two elements
-                joint_q_x = body_q_torch[0]
-                joint_q_y = body_q_torch[1]
-
-                # Extract Y rotation from quaternion
-                # body_q format: [x, y, z, qw, qx, qy, qz]
-                if body_q_dim == 7:
-                    quat_w = body_q_torch[3]
-                    quat_x = body_q_torch[4]
-                    quat_y = body_q_torch[5]
-                    quat_z = body_q_torch[6]
-
-                    # Extract Y-axis rotation (pitch) from quaternion
-                    # For a quaternion [qw, qx, qy, qz], Y-axis rotation (pitch) in ZYX euler is:
-                    # pitch = asin(2*(qw*qy - qx*qz))
-                    # But for a D6 joint with Y rotation axis, we can also use:
-                    # For a pure Y-axis rotation: q = [cos(θ/2), 0, sin(θ/2), 0]
-                    # So: θ = 2 * atan2(qy, qw)
-                    # However, for general quaternions, we use the euler angle extraction
-                    # Using asin for pitch (Y rotation): pitch = asin(2*(qw*qy - qx*qz))
-                    # Clamp to valid range for asin: [-1, 1]
-                    sin_pitch = 2.0 * (quat_w * quat_y - quat_x * quat_z)
-                    sin_pitch = torch.clamp(sin_pitch, -1.0, 1.0)
-                    joint_q_rot_y = torch.asin(sin_pitch)
-                else:
-                    # Fallback: assume no rotation
-                    joint_q_rot_y = torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
-                # Construct joint_q vector: [x, y, rotation_y]
-                joint_q_vec = torch.stack([joint_q_x, joint_q_y, joint_q_rot_y])
-
-                # Set joint_q in the state
-                joint_q_wp = wp.from_torch(joint_q_vec.unsqueeze(0))  # Add batch dimension
-                new_state.joint_q.assign(joint_q_wp)
-
             idx += body_q_dim
 
         # Extract and set body_qd if present
@@ -469,77 +423,119 @@ class TrueDMSMPCAgent(Agent):
         x = torch.cat([x_u_short[:, : self.state_dim], last_x.unsqueeze(0)], dim=0)
         u = x_u_short[:, self.state_dim :]
 
-        # ========== TASK COST ==========
-        # Reference height from RollingPin (self.h = 0.125)
-        h_ref = 0.125
+        # ========== TASK COST (VECTORIZED) ==========
+        task_cost = self._compute_task_cost_vectorized(x, u)
 
-        task_cost = 0.0
-
-        # Vecotirzien
-        # dummy set
-        # Stage costs
-        for i in range(self.N):
-            # Extract only particle positions from state (first mpm_pos_dim elements)
-            # State format: [mpm_x (num_particles*3), mpm_v (num_particles*3), body_q (7), body_qd (6)]
-            mpm_x_flat = x[i][:self.mpm_pos_dim]
-            particles = mpm_x_flat.reshape(self.num_particles, 3)
-
-            # Extract heights (y-coordinates, index 1)
-            heights = particles[:, 1]
-
-            # Cost 1: Average height (penalize high dough)
-            # RollingPin reward: 1.0 / (1.0 + mean_height/h_ref)^2
-            # Cost (minimize): mean_height / h_ref
-            mean_height = heights.mean()
-            height_cost = (mean_height / h_ref) ** 2  # Squared to match reward scaling
-
-            # Cost 2: Height variance (penalize non-uniform height)
-            # RollingPin reward: -variance
-            # Cost (minimize): variance
-            variance_cost = heights.var()
-
-            # Cost 3: Control effort
-            control_cost = self.cost_control * (u[i] @ u[i])
-
-            # Total stage cost
-            stage_cost = self.cost_state * (height_cost + variance_cost) + control_cost
-            task_cost += stage_cost
-
-        # Terminal cost: emphasize final state (flat + uniform)
-        mpm_x_flat_final = x[self.N][:self.mpm_pos_dim]
-        particles_final = mpm_x_flat_final.reshape(self.num_particles, 3)
-        heights_final = particles_final[:, 1]
-        mean_height_final = heights_final.mean()
-        variance_final = heights_final.var()
-
-        terminal_cost = self.cost_terminal * ((mean_height_final / h_ref) ** 2 + variance_final)
-        task_cost += terminal_cost
-
-        # ========== CONSTRAINT PENALTIES ==========
-        constraint_penalty = 0.0
-
-        # Initial constraint: first state must match current state
-        initial_violation = torch.sum((x[0] - current_x) ** 2)
-        constraint_penalty += initial_violation
-
-        # Dynamics constraints: x[i+1] should match f(x[i], u[i])
-        for i in range(self.N):
-            # Set environment to state x[i] and simulate
-            state_at_node_i = self._set_state_from_vector(x[i], template_state)
-            next_state_sim = self.simulate_single_step(state_at_node_i, u[i], return_torch=True)
-
-            # Penalty for violation: ||x[i+1] - f(x[i], u[i])||^2
-            dynamics_violation = torch.sum((x[i + 1] - next_state_sim) ** 2)
-            constraint_penalty += dynamics_violation
+        # ========== CONSTRAINT PENALTIES (VECTORIZED) ==========
+        constraint_penalty = self._compute_constraint_penalty_vectorized(x, u, current_x, template_state)
 
         # Total loss
         total_loss = task_cost + self.penalty_weight * constraint_penalty
 
-        # Store components for diagnostics (as attributes so we can access them)
+        # Store components for diagnostics
         self._last_task_cost = task_cost.item()
         self._last_constraint_penalty = constraint_penalty.item()
 
         return total_loss
+
+    def _compute_task_cost_vectorized(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Vectorized computation of task cost (stage costs + terminal cost).
+
+        Args:
+            x: States, shape (N+1, state_dim)
+            u: Controls, shape (N, control_dim)
+
+        Returns:
+            task_cost: Scalar tensor
+        """
+        h_ref = 0.125
+
+        # ===== VECTORIZED STAGE COSTS =====
+        # Extract positions from all N stage states at once: (N, mpm_pos_dim)
+        x_stage = x[:self.N]  # (N, state_dim)
+        mpm_x_stage = x_stage[:, :self.mpm_pos_dim]  # (N, mpm_pos_dim)
+
+        # Reshape to (N, num_particles, 3)
+        particles_stage = mpm_x_stage.reshape(self.N, self.num_particles, 3)
+
+        # Extract heights (y-coordinates): (N, num_particles)
+        heights_stage = particles_stage[:, :, 1]
+
+        # Cost 1: Average height per node (N,)
+        mean_heights = heights_stage.mean(dim=1)  # (N,)
+        height_costs = (mean_heights / h_ref) ** 2  # (N,)
+
+        # Cost 2: Height variance per node (N,)
+        variance_costs = heights_stage.var(dim=1)  # (N,)
+
+        # Cost 3: Control effort per node (N,)
+        control_costs = self.cost_control * (u * u).sum(dim=1)  # (N,)
+
+        # Total stage costs: sum over all N nodes
+        stage_cost = self.cost_state * (height_costs.sum() + variance_costs.sum()) + control_costs.sum()
+
+        # ===== TERMINAL COST =====
+        mpm_x_final = x[self.N][:self.mpm_pos_dim]  # (mpm_pos_dim,)
+        particles_final = mpm_x_final.reshape(self.num_particles, 3)
+        heights_final = particles_final[:, 1]
+
+        mean_height_final = heights_final.mean()
+        variance_final = heights_final.var()
+
+        terminal_cost = self.cost_terminal * ((mean_height_final / h_ref) ** 2 + variance_final)
+
+        return stage_cost + terminal_cost
+
+    def _compute_constraint_penalty_vectorized(
+        self, x: torch.Tensor, u: torch.Tensor, current_x: torch.Tensor, template_state: Any
+    ) -> torch.Tensor:
+        """Vectorized computation of constraint penalties.
+
+        Args:
+            x: States, shape (N+1, state_dim)
+            u: Controls, shape (N, control_dim)
+            current_x: Current state
+            template_state: Template simulation state
+
+        Returns:
+            constraint_penalty: Scalar tensor
+        """
+        # Initial constraint: first state must match current state
+        initial_violation = torch.sum((x[0] - current_x) ** 2)
+
+        # Dynamics constraints: vectorized simulation
+        # Simulate all N shooting intervals in parallel
+        next_states_sim = self._simulate_batch_parallel(x[:self.N], u, template_state)  # (N, state_dim)
+
+        # Compute violations: ||x[i+1] - f(x[i], u[i])||^2 for all i
+        dynamics_violations = torch.sum((x[1:self.N+1] - next_states_sim) ** 2, dim=1)  # (N,)
+        dynamics_penalty = dynamics_violations.sum()
+
+        return initial_violation + dynamics_penalty
+
+    def _simulate_batch_parallel(
+        self, x_batch: torch.Tensor, u_batch: torch.Tensor, template_state: Any
+    ) -> torch.Tensor:
+        """Simulate N shooting intervals in parallel using batched environments.
+
+        Args:
+            x_batch: Initial states for each interval, shape (N, state_dim)
+            u_batch: Controls for each interval, shape (N, control_dim)
+            template_state: Template simulation state
+
+        Returns:
+            next_states: Resulting states after simulation, shape (N, state_dim)
+        """
+        # TODO: This requires environment to support parallel execution with different initial states
+        # For now, fall back to sequential execution (will be optimized later)
+
+        next_states = []
+        for i in range(self.N):
+            state_i = self._set_state_from_vector(x_batch[i], template_state, zero_internal_states=(i > 0))
+            next_state = self.simulate_single_step(state_i, u_batch[i], return_torch=True)
+            next_states.append(next_state)
+
+        return torch.stack(next_states)  # (N, state_dim)
 
 
     def dms_plan(self, current_x: np.ndarray, init_state: Any) -> torch.Tensor:
@@ -584,7 +580,7 @@ class TrueDMSMPCAgent(Agent):
                 # Initialize controls with small random values
                 control_start = i * self.dim + self.state_dim
                 control_end = control_start + self.control_dim
-                # x_u_init[control_start:control_end] = torch.randn(self.control_dim, device=self.device) * 0.1
+                x_u_init[control_start:control_end] = torch.randn(self.control_dim, device=self.device) * 0.1
             # Final state
             x_u_init[self.N * self.dim : self.N * self.dim + self.state_dim] = current_x_torch
 
@@ -603,15 +599,16 @@ class TrueDMSMPCAgent(Agent):
         print(f"  Penalty weight: {self.penalty_weight}")
         print(f"  Learning rate: {self.learning_rate}")
         print(f"  Max iterations: {self.max_iter}")
+        print("  Using differentiable simulation with Adam optimizer ✓")
 
         # Print initial controls
-        # with torch.no_grad():
-        #     initial_controls = []
-        #     for i in range(self.N):
-        #         control_start = i * self.dim + self.state_dim
-        #         control_end = control_start + self.control_dim
-        #         initial_controls.append(x_u[control_start:control_end].cpu().numpy())
-        #     print(f"  Initial controls: {[f'[{c[0]:.3f} {c[1]:.3f} {c[2]:.3f}]' for c in initial_controls]}")
+        with torch.no_grad():
+            initial_controls = []
+            for i in range(self.N):
+                control_start = i * self.dim + self.state_dim
+                control_end = control_start + self.control_dim
+                initial_controls.append(x_u[control_start:control_end].cpu().numpy())
+            print(f"  Initial controls: {[f'[{c[0]:.3f} {c[1]:.3f} {c[2]:.3f}]' for c in initial_controls]}")
         print(f"{'=' * 70}\n")
 
         # Optimization loop

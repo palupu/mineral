@@ -58,3 +58,28 @@ python3 -m mineral.scripts.run \
     task.env.episode_length=10 \
     task.env.render=True \
     num_envs=1 run=eval
+
+# =============================================================================
+# TRUE DMS (Advanced - 10-20× slower than single shooting!)
+# =============================================================================
+# Recommended only for unstable dynamics or research purposes
+# Expected time: ~30-60 minutes per run (vs 3-5 minutes for single shooting)
+#
+# Configuration:
+#   - N=8: Horizon length (reduce to 5 for faster testing)
+#   - timesteps=20: Number of MPC steps (reduce to 10 for testing)
+#   - state_setting_strategy='joint_only': Recommended strategy
+#
+# TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+# WARP_RENDER_DIR="workdir/renders/TrueDMS/${TIMESTAMP}" \
+# python3 -m mineral.scripts.run \
+#     task=Rewarped agent=TrueDMS \
+#     task.env.env_name=RollingPin \
+#     task.env.env_suite=plasticinelab \
+#     task.env.episode_length=20 \
+#     task.env.render=True \
+#     num_envs=1 run=eval \
+#     agent.dms_mpc_params.N=8 \
+#     agent.dms_mpc_params.timesteps=20 \
+#     agent.dms_mpc_params.max_iter=15 \
+#     agent.dms_mpc_params.state_setting_strategy=joint_only
