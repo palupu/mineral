@@ -195,6 +195,7 @@ if __name__ == '__main__':
     )(lambda x: c.append(x))()
     config = c[0]
 
+    print(f'config: {config}')
     task_suite = config.task.get('suite', 'isaacgymenvs')
     if task_suite == 'isaacgymenvs':
         from ..envs.isaacgymenvs import import_isaacgym
