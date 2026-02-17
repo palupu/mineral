@@ -1,3 +1,5 @@
+<!-- Command for sapo training -->
+
 python3 -m mineral.scripts.run \
 task=Rewarped agent=RewarpedJumperSAPO task.env.env_name=RollingPin task.env.env_suite=plasticinelab \
 \

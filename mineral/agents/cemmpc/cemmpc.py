@@ -1,9 +1,9 @@
 import copy
+import glob
+import os
 import time
 
-import matplotlib.animation as animation
-import matplotlib.pyplot as plt
-import numpy as np
+import colorednoise
 import torch
 import warp as wp
 
@@ -11,82 +11,85 @@ from mineral.agents.agent import Agent
 
 
 class CEMMPCAgent(Agent):
-    r"""Constant Control Test Agent.
+    r"""Cross Entropy Method Model Predictive Control using iCEM with colored noise and warm-starting of elite trajectories.
 
-    This is a test agent for exploring robot control by applying constant
-    control inputs. Use this to learn what each control dimension does by
-    observing the resulting robot movement.
+    MPC is performed by:
+    1) Sampling action sequences (trajectories) using CEM + colored noise.
+    2) Rolling out the trajectories in parallel in a batched simulation.
+    3) Selecting elite trajectories and using the elites to update the mean/std of the sampling distribution.
+    4) Executing only the first action of the best trajectory at each timestep (MPC).
 
-    Usage Examples:
-        # Test with default control (zeros - no input)
-        agent = CEMMPCAgent(cfg)
-        agent.eval()
-
-        # Test with custom constant control values
-        agent = CEMMPCAgent(cfg)
-        agent.set_constant_control([0.5, -0.3, 0.0, 1.0])
-        agent.eval()
-
-        # Test one control at a time to isolate effects
-        agent.set_constant_control([1.0, 0.0, 0.0, 0.0])  # Test first control
-        agent.eval()
-
-        # Test all maximum values
-        agent.set_constant_control([1.0] * action_dim)
-        agent.eval()
+    Attributes:
+        H (int): MPC planning horizon.
+        N (int): Number of sampled trajectories.
+        K (int): Elite-set size.
+        iterations (int): Number of CEM iterations per planning step.
+        timesteps (int): Total number of MPC timesteps executed.
+        beta (float): Exponent for colored-noise temporal correlation.
+        keep_elite_fraction (float): Fraction of previous elites retained.
+        alpha (float): Momentum coefficient for smoothing mean/std across iterations.
+        initial_std (float): Initial standard deviation of sampled actions.
+        previous_elite_actions (torch.Tensor | None): Stored elite trajectories.
+        previous_mean (torch.Tensor | None): Mean action sequence from previous time step.
     """
-
     def __init__(self, full_cfg, **kwargs):
+        """Load configuration parameters.
+
+        Args:
+            full_cfg: Hydra config containing agent, network, and CEM/MPC settings.
+            **kwargs: Passed through to the parent Agent class.
+
+        Outputs:
+            - Initializes MPC parameters (H, N, K, iterations, ...).
+            - Allocates buffers for warm-starting (previous_mean, previous_elite_actions).
+            - Initializes internal environment state placeholders (`obs`, `dones`).
+        """
         self.network_config = full_cfg.agent.network
         self.params = full_cfg.agent.params
         self.num_actors = self.params.num_actors
         self.max_agent_steps = int(self.params.max_agent_steps)
         self.render_results = self.params.render_results
+        self.seed = self.params.seed
 
-        # Get simulation parameters
+        # Collect all CEM MPC Parameters
         self.cem_mpc_params = full_cfg.agent.cem_mpc_params
+        self.H = self.cem_mpc_params.H
         self.N = self.cem_mpc_params.N
+        self.K = self.cem_mpc_params.K
+        self.iterations = self.cem_mpc_params.iterations
         self.timesteps = self.cem_mpc_params.timesteps
+        self.beta = self.cem_mpc_params.beta
+        self.keep_elite_fraction = self.cem_mpc_params.keep_elite_fraction
+        self.alpha = self.cem_mpc_params.alpha
+        self.initial_std = self.cem_mpc_params.initial_std
 
         super().__init__(full_cfg, **kwargs)
 
         self.obs = None
         self.dones = None
 
-        # Constant control values for testing
-        # Set these using set_constant_control() method
-        self.constant_control_values = None  # Will be set based on action_dim after env init
-
-    def set_constant_control(self, values):
-        """Set constant control values for testing.
-
-        Args:
-            values: list, tuple, numpy array, or torch tensor of control values
-                   Should match the action dimension of the environment
-
-        Example:
-            agent.set_constant_control([0.5, -0.3, 0.0, 1.0])  # 4D control
-            agent.set_constant_control([0.0] * action_dim)      # All zeros
-            agent.set_constant_control([1.0] * action_dim)      # All max
-        """
-        if isinstance(values, (list, tuple)):
-            self.constant_control_values = torch.tensor(values, device=self.device, dtype=torch.float32)
-        elif isinstance(values, np.ndarray):
-            self.constant_control_values = torch.from_numpy(values).float().to(self.device)
-        elif isinstance(values, torch.Tensor):
-            self.constant_control_values = values.float().to(self.device)
-        else:
-            raise ValueError("values must be a list, tuple, numpy array, or torch tensor")
-
-        print(f"Constant control values set to: {self.constant_control_values}")
+        # Warm start
+        self.previous_elite_actions = None
+        self.previous_mean = None
 
     def clone_state(self, state):
-        s = type(state)()  # create a new empty State object of the same type
+        """Deep-copy a Warp simulation state.
+
+        Args:
+        state: Environment sim state containing Warp tensors and Python attributes.
+
+        Returns:
+        A new cloned simulation state where:
+            - Warp tensors are cloned using wp.clone().
+            - Python objects are deep-copied.
+        """
+        # Create a new empty State object of the same type
+        s = type(state)()
 
         # Attributes to clone with wp.clone
         wp_clone_attrs = [
             "body_f", "body_q", "body_qd", "joint_q", "joint_qd", "mpm_C", "mpm_F", "mpm_F_trial",
-            "mpm_grid_m", "mpm_grid_mv", "mpm_grid_v", "mpm_stress", "mpm_x", "mpm_v",
+            "mpm_grid_m", "mpm_grid_mv", "mpm_grid_v", "mpm_stress", "mpm_x", "mpm_v"
         ]
 
         # Attributes to deep copy
@@ -101,46 +104,216 @@ class CEMMPCAgent(Agent):
 
         return s
 
-
     def eval(self):
-        """Run the test agent with constant control."""
+        """Entry point called by training/evaluation loop.
+
+        Behavior:
+            - If render_results is True -> replay stored trajectories and save as reward file.
+            - Otherwise -> run CEM MPC evaluation over one or multiple N values.
+
+        Output:
+            - Runs evaluation or replay depending on config.
+        """
         if self.render_results:
             self.replay_trajectory()
-        else:
-            start_time = time.time()
-            self.run_constant_control_test()
-            end_time = time.time()
-            print(f"Time taken: {end_time - start_time:.2f}s")
 
-    def run_constant_control_test(self):
-        """Run the test with constant control values."""
+        else:
+            # Specify N values to evaluate
+            # Example: N_values = [64, 128, 256] or single N_values = [128]
+            # self.eval_multiple([64, 128, 256])
+            self.eval_multiple([self.N])
+
+    def generate_action_sequences(self, mean, std, elite_actions, iteration=0):
+        """Generate action trajectories using Gaussian sampling + colored noise (iCEM).
+
+        Args:
+            mean (torch.Tensor): Mean action trajectory of shape (H, action_dim).
+            std (torch.Tensor): Standard deviation trajectory of shape (H, action_dim).
+            elite_actions (torch.Tensor | None): Previously elite trajectories (warm start).
+            iteration (int): Current CEM iteration index.
+
+        Returns:
+            torch.Tensor: Sampled action sequences with shape (N, H, action_dim).
+        """
+        mean_exp = mean.unsqueeze(0).expand(self.N, -1, -1)     # Shape: (N, H, action_dim)
+        std_exp = std.unsqueeze(0).expand(self.N, -1, -1)       # Shape: (N, H, action_dim)
+
+        # Generate colored noise (N, action_dim, H) --> transpose to (N, H, action_dim)
+        # Colored noise generated should be temporally correlated along the axis of H
+        noise = colorednoise.powerlaw_psd_gaussian(
+            self.beta, size=(self.N, self.action_dim, self.H)
+        ).transpose(0, 2, 1)
+        noise = torch.from_numpy(noise).cuda().float()          # Shape: (N, H, action_dim)
+
+        # Scale the distribution by noise * std
+        action_sequences = mean_exp + noise * std_exp           # Shape: (N, H, action_dim)
+
+        # [iCEM 3.3] - Clipping at the action boundaries (clip)
+        # Clip actions to range of [-1, 1]
+        env_action_low = torch.from_numpy(self.env.action_space.low).float().to(self.device)    # low:  -1
+        env_action_high = torch.from_numpy(self.env.action_space.high).float().to(self.device)  # high:  1
+        action_sequences = torch.clip(action_sequences, env_action_low, env_action_high)
+
+        # [iCEM 3.2] - CEM with memory
+        # Keep a fraction of the elites and shift elites every iteration
+        if (iteration == 0) and elite_actions is not None:
+            num_elite_to_add = int(self.keep_elite_fraction * self.K)
+            shifted_elite = torch.roll(elite_actions[:num_elite_to_add], -1, dims=1)
+            action_sequences[:num_elite_to_add] = shifted_elite
+
+        elif elite_actions is not None:
+            num_elite_to_add = int(self.keep_elite_fraction * self.K)
+            action_sequences[:num_elite_to_add] = elite_actions[:num_elite_to_add]
+
+        if iteration == self.iterations - 1:
+            action_sequences[-1] = mean
+
+        return action_sequences
+
+    def evaluate_action_sequence_batch(self, init_state, action_sequences):
+        """Roll out sampled action trajectories in a batched simulation  in parallel by copying the current state.
+
+        Args:
+            init_state: Initial environment state (cloned before rollouts).
+            action_sequences (torch.Tensor): Action sequences with shape (N, H, action_dim).
+
+        Returns:
+            torch.Tensor: Total reward for each trajectory of shape (N,).
+        """
+        # Initialise rewards tensor with shape (N,)
+        batch_size = self.num_actors
+        rewards = torch.zeros(self.N, device=self.device)
+
+        # Batch the rewards based on the amount of samples
+        for start_idx in range(0, self.N, batch_size):
+            end_idx = min(start_idx + batch_size, self.N)
+            batch_sequences = action_sequences[start_idx:end_idx]
+            batch_N = batch_sequences.shape[0]
+
+            # Copy the current state of the env to perform actions
+            self.env.state_0 = self.clone_state(init_state)
+            batch_rewards = torch.zeros(batch_N, device=self.device)
+
+            for h in range(self.H):
+                actions_h = batch_sequences[:, h, :]   # Shape: (batch_N, action_dim)
+
+                # Pad actions to match num_actors if needed
+                if batch_N < self.num_actors:
+                    # Repeat the last action or pad with zeros
+                    padded_actions = torch.zeros(self.num_actors, self.action_dim, device=self.device)
+                    padded_actions[:batch_N] = actions_h
+                    actions_h = padded_actions
+
+                _, r ,_, _ = self.env.step(actions_h)
+                batch_rewards += r[:batch_N]
+
+            rewards[start_idx:end_idx] = batch_rewards
+
+        return rewards
+
+    def cem_plan(self, init_state, previous_elite_actions=None):
+        """Perform one full CEM optimization loop to find the best action sequence.
+
+        Args:
+            init_state: Simulation state at beginning of planning step.
+            previous_elite_actions (torch.Tensor | None): Warm-start elite trajectories.
+
+        Returns:
+            (tuple):
+                torch.Tensor: First action of best sequence (shape: action_dim).
+                torch.Tensor: Elite action trajectories (shape: K, H, action_dim).
+        """
+        # # TESTING: No warm start of mean
+        # mean = torch.zeros((self.H, self.action_dim), device=self.device)                       # Mean
+        # std = torch.ones((self.H, self.action_dim), device=self.device) * self.initial_std      # Standard deviation
+
+        # Warm start of mean
+        if self.previous_mean is not None:
+            # Shift mean one step forward (discard the executed action)
+            shifted_mean = torch.zeros_like(self.previous_mean)
+            shifted_mean[:-1] = self.previous_mean[1:]               # Shift forward
+            shifted_mean[-1] = torch.zeros_like(shifted_mean[-1])    # Fresh last step
+            mean = shifted_mean.clone()
+        else:
+            # Initialize from scratch if no previous mean
+            mean = torch.zeros((self.H, self.action_dim), device=self.device)
+
+        std = torch.ones((self.H, self.action_dim), device=self.device) * self.initial_std
+
+        prev_mean = mean.clone()
+        prev_std = std.clone()
+
+        # Use previous elite actions from last timestep for first iteration
+        elite_actions = previous_elite_actions
+
+        for iteration in range(self.iterations):
+            # Generation action sequences and allocate rewards for each action sequence
+            action_sequences = self.generate_action_sequences(mean, std, elite_actions, iteration)
+            rewards = self.evaluate_action_sequence_batch(init_state, action_sequences)
+
+            # Sort the rewards array and pick only the top K elements
+            _, elite_idxs = torch.topk(rewards, self.K)
+            elite_actions = action_sequences[elite_idxs]
+
+            # [iCEM 3.3] - Executing the best action (best-a)
+            # Identify the best trajectory among elites (first element in sorted elites)
+            best_action_sequence = action_sequences[elite_idxs[0]]
+
+            # Update the values of mu and sigma after iteration
+            new_mean = elite_actions.mean(dim=0)
+            new_std = elite_actions.std(dim=0) + 1e-3   # Stability
+
+            # Momentum update
+            mean = (self.alpha * prev_mean) + ((1 - self.alpha) * new_mean)
+            std = (self.alpha * prev_std) + ((1 - self.alpha) * new_std)
+
+            # Update values for next iteration
+            prev_mean = mean.clone()
+            prev_std = std.clone()
+
+        # Store the mean of the best action sequence for warm starting next timestep
+        self.previous_mean = mean.detach().clone()
+
+        # Return the first action of the best sequence
+        return best_action_sequence[0], elite_actions
+
+    def run_cem_mpc(self, save_name="trajectory.pt"):
+        """Run MPC loop: at each time step, perform CEM planning and execute the best action.
+
+        Args:
+            save_name (str): Filename to save executed best action trajectory.
+
+        Output:
+            - Writes trajectory to disk.
+            - Prints time step, best action and step reward.
+        """
         # Initialise environment
         obs = self.env.reset()
         self.obs = self._convert_obs(obs)
         self.dones = torch.zeros((self.num_actors,), dtype=torch.bool, device=self.device)
         total_reward = 0.0
 
-        # Initialize constant control values if not set
-        if self.constant_control_values is None:
-            # Default: zeros (no control input)
-            self.constant_control_values = torch.tensor([0.0, 0.0, 1.0], device=self.device)
-            print(f"\n{'='*60}")
-            print("CONSTANT CONTROL TEST MODE")
-            print(f"Action dimension: {self.action_dim}")
-            print(f"Control values: {self.constant_control_values}")
-            print(f"{'='*60}\n")
-
         # Create list to save actions
-        actions_list = []
+        best_actions_list = []
 
-        # Main loop - apply constant control at each timestep
+        # Main loop
+        print(f"\n===== Running evaluation with N={self.N} =====")
         for timestep in range(self.timesteps):
             if self.dones[0]:
-                break  # Stop if environment is done
+                break  # Stop if real environment is done
 
-            # Use constant control values
-            action = self.constant_control_values.clone()
-            actions = action.unsqueeze(0) #.repeat(self.N, 1)    # Shape: (N, action_dim)
+            # Save the initial state
+            init_state = self.clone_state(self.env.state_0)
+
+            # Evaluate new best action
+            best_action, elite_actions = self.cem_plan(init_state, self.previous_elite_actions)
+            actions = best_action.unsqueeze(0).repeat(self.num_actors, 1)   # Shape: (64, action_dim)
+
+            # Store elite actions for next timestep
+            self.previous_elite_actions = elite_actions
+
+            # Reset state of all environments
+            self.env.state_0 = init_state
 
             # Step the environment forward
             obs, reward, done, _ = self.env.step(actions)
@@ -148,89 +321,74 @@ class CEMMPCAgent(Agent):
             self.dones = done
             total_reward += reward[0]
 
-            # Save action
-            actions_list.append(action.clone())
+            # Append actions to best action list
+            best_actions_list.append(best_action.clone())
 
-            print(f"[TEST] Timestep {timestep + 1} | Action: {action} | Reward: {reward[0]:.3f}")
+            print(f"Timestep {timestep + 1} | Action: {best_action} | Reward: {reward[0]:.3f}")
+            # tqdm.write(f"Timestep {timestep + 1} | Action: {best_action} | Reward: {reward[0]:.3f}")
 
-        print("\n" + "="*60)
-        print("Test complete")
+        print("Evaluation complete")
         print(f"Total reward: {total_reward:.3f}")
-        print(f"Average reward: {total_reward/len(actions_list):.3f}")
-        print("="*60 + "\n")
 
         # Save trajectory as PyTorch file
-        actions_tensor = torch.stack(actions_list)
-        torch.save(actions_tensor, 'test_trajectory.pt')
-        print("Test trajectory saved to 'test_trajectory.pt'")
+        best_actions_tensor = torch.stack(best_actions_list)
 
-    def replay_trajectory(self, trajectory_file='test_trajectory.pt'):
-        """Replay a saved trajectory and visualize results."""
+        torch.save(best_actions_tensor, save_name)
+        print(f"Trajectory {self.N} saved")
+
+    def eval_multiple(self, N_values):
+        """Run multiple evaluations by sweeping different sample sizes N.
+
+        Args:
+            N_values (list[int]): Values of N to test and save.
+        """
+        for N in N_values:
+            # Override N and reset previous_elite_actions
+            self.N = N
+            self.previous_elite_actions = None
+            self.previous_mean = None
+
+            start_time = time.time()
+            self.run_cem_mpc(save_name=f"trajectory_{N}_seed_{self.seed}_std_{self.initial_std}.pt")
+            end_time = time.time()
+            print(f"Time taken: {end_time - start_time}")
+
+
+    def replay_trajectory(self):
+        """Replay previously saved action trajectories on disk and log rewards.
+
+        Searches and loads matching files in the following format:
+            trajectory_*_seed_{seed}_std_{initial_std}.pt
+
+        Outputs:
+            - Runs env in real time.
+            - Saves reward logs to disk.
+        """
         # Initialise environment
         obs = self.env.reset()
         self.obs = self._convert_obs(obs)
-        self.dones = torch.zeros((self.num_actors,), dtype=torch.bool, device=self.device)
 
-        print(f"\nReplaying trajectory from '{trajectory_file}'...")
+        # Collect all trajectory files
+        trajectory_files = glob.glob(f"trajectory_*_seed_{self.seed}_std_{self.initial_std}.pt")
+        for file in trajectory_files:
+            actions_to_replay = torch.load(file)
 
-        rewards = []
-        actions_to_replay = torch.load(trajectory_file)
+            rewards = []
+            timestep = 0
 
-        timestep = 0
-        for action in actions_to_replay:
-            obs, reward, done, _ = self.env.step(action)
-            self.obs = self._convert_obs(obs)
-            self.dones = done
+            for action in actions_to_replay:
+                obs, reward, done, _ = self.env.step(action)
+                self.obs = self._convert_obs(obs)
+                self.dones = done
 
-            print(f"Timestep {timestep + 1} | Action: {action} | Reward: {reward[0]:.3f}")
-            timestep += 1
-            rewards.append(reward[0].item())
+                print(f"Time step {timestep + 1} | Action: {action} | Reward: {reward[0]:.3f}")
+                timestep += 1
+                rewards.append(reward[0].item())
+            print("Trajectory completed")
 
-        print("\nReplay complete!")
-        print(f"Total reward: {sum(rewards):.3f}")
-        print(f"Average reward: {np.mean(rewards):.3f}")
+            # Save rewards tensor as pytorch file
+            base_name = os.path.basename(file)
+            idx = base_name.replace("trajectory_", "").replace(".pt", "")
+            reward_filename = f"reward_{idx}.pt"
 
-        # Plot static reward curve
-        plt.figure(figsize=(10, 6))
-        plt.plot(rewards, linewidth=2)
-        plt.xlabel("Timestep", fontsize=12)
-        plt.ylabel("Reward", fontsize=12)
-        plt.title("Constant Control Test - Reward over Time", fontsize=14)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("test_reward_plot.png", dpi=300)
-        print("\nStatic plot saved to 'test_reward_plot.png'")
-
-        # Animated plot
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.set_xlim(0, len(rewards))
-        reward_range = max(rewards) - min(rewards)
-        ax.set_ylim(min(rewards) - 0.1 * reward_range, max(rewards) + 0.1 * reward_range)
-        ax.set_xlabel("Timestep", fontsize=12)
-        ax.set_ylabel("Reward", fontsize=12)
-        ax.set_title("Constant Control Test - Reward Animation", fontsize=14)
-        ax.grid(True, alpha=0.3)
-
-        line, = ax.plot([], [], lw=2, label="Step Reward")
-        ax.legend()
-
-        xdata, ydata = [], []
-
-        def init():
-            line.set_data([], [])
-            return line,
-
-        def update(frame):
-            xdata.append(frame)
-            ydata.append(rewards[frame])
-            line.set_data(xdata, ydata)
-            return line,
-
-        ani = animation.FuncAnimation(
-            fig, update, frames=len(rewards),
-            init_func=init, blit=True, interval=100, repeat=False
-        )
-
-        # Save animation as GIF
-        ani.save("test_reward_animation.gif", writer="pillow", fps=30)
-        print("Animation saved to 'test_reward_animation.gif'")
+            torch.save(rewards, reward_filename)
