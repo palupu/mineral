@@ -28,6 +28,8 @@ params:
   render_results: false  # Set to true to replay saved trajectory
 
 dss_mpc_params:
+    run_sapo_seperately: false  # Run SAPO policy seperately
+    sapo_sample: false  # Sample from SAPO policy
     # ========== Horizon Parameters ==========
     N: 8  # Number of control steps in horizon
           # Single shooting optimizes N control inputs: [u0, ..., u_{N-1}]
@@ -35,7 +37,7 @@ dss_mpc_params:
           # Much smaller than DMS! (DMS would have N × (state_dim + control_dim))
           # Can use larger N since optimization is low-dimensional
     
-    timesteps: 50  # Total MPC steps to execute
+    timesteps: 300  # Total MPC steps to execute
                    # Each timestep: plan horizon, execute u[0], shift warm start
     
     # ========== Optimization Parameters (PyTorch Adam) ==========
@@ -49,6 +51,14 @@ dss_mpc_params:
                          # Lower = slower but more stable
                          # Typical range: 0.001 - 0.1
                          # Start with 0.01, adjust based on convergence
+    
+    # ========== SHAC Policy Initialization ==========
+    # shac_ckpt_path: "/app/workdir/RewarpedRollingPin4M-SAPO/20251216-041123.97/ckpt/"  
+    # Path to SHAC checkpoint for generating initial control sequences
+                          # Can be a directory (will look for best_rewards15.15.pth) or a specific .pth file
+                          # Example: "/app/workdir/RewarpedRollingPin4M-SAPO/20251216-041123.97/ckpt/"
+                          # If null, MPC will start from zero-initialized controls
+                          # If provided, SHAC policy will be used to generate initial guess via environment rollout
     
     # ========== Cost Function Weights (used by DMS, not single shooting) ==========
     # Single shooting uses environment reward directly
